@@ -1,5 +1,5 @@
 requests
-beatifulsoup
+beautifulsoup4
 pypdf
 unidecode
 urllib3
