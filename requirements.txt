@@ -4,5 +4,5 @@ beautifulsoup4
 pypdf
 unidecode
 urllib3
-python-telegram-bot
 python-telegram-bot[job-queue]
+flask
