@@ -4,7 +4,6 @@ from unidecode import unidecode
 from bs4 import BeautifulSoup
 import threading
 import requests
-import certifi
 import json
 import os
 import urllib3
@@ -53,7 +52,7 @@ TI_TERMOS = [
 # 1. Buscar editais no site
 # =============================
 def pegar_editais():
-    r = requests.get(URL, verify=certifi.where())
+    r = requests.get(URL, verify=False)
     soup = BeautifulSoup(r.text, "html.parser")
 
     editais = []
