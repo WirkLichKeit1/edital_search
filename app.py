@@ -253,7 +253,19 @@ async def auto(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # MAIN
 # =============================
 
-def rodar_bot():
+@flask_app.route('/')
+def home():
+    return "Rodando..."
+
+def rodar_flask():
+    port = int(os.environ.get("PORT"))
+    print(f"Servidor rodando na porta: {port}")
+    flask_app.run(host="0.0.0.0", port=port)
+
+def main():
+    t = threading.Thread(target=rodar_flask)
+    t.start()
+    
     print("🤖 Bot rodando...")
 
     app = Application.builder().token(TOKEN).build()
@@ -263,19 +275,6 @@ def rodar_bot():
     app.add_handler(CommandHandler("auto", auto))
 
     app.run_polling()
-
-@flask_app.route('/')
-def home():
-    return "Rodando..."
-
-def main():
-    t = threading.Thread(target=rodar_bot)
-    t.start()
-
-    port = int(os.environ.get("PORT"))
-    print(f"Servidor rodando na porta: {port}")
-
-    flask_app.run(host="0.0.0.0", port=port)
 
 if __name__ == "__main__":
     main()
