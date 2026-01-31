@@ -1,9 +1,11 @@
-import requests
-from bs4 import BeautifulSoup
-import json
-import os
+from flask import Flask
 from pypdf import PdfReader
 from unidecode import unidecode
+from bs4 import BeautifulSoup
+import threading
+import requests
+import json
+import os
 import urllib3
 from dotenv import load_dotenv
 
@@ -11,6 +13,8 @@ from telegram import Update
 from telegram.ext import Application, CommandHandler, ContextTypes
 
 load_dotenv()
+
+flask_app = Flask(__name__)
 
 # =============================
 # CONFIGURAÇÕES
@@ -249,7 +253,7 @@ async def auto(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # MAIN
 # =============================
 
-def main():
+def rodar_bo():
     print("🤖 Bot rodando...")
 
     app = Application.builder().token(TOKEN).build()
@@ -260,6 +264,18 @@ def main():
 
     app.run_polling()
 
+@flask_app.route('/')
+def home():
+    return "Rodando..."
+
+def main():
+    t = threading.Thread(target=rodar_bot)
+    t.start()
+
+    port = int(os.environ.get("PORT"))
+    print(f"Servidor rodando na porta: {port}")
+
+    flask_app.run(host="0.0.0.0", port=port)
 
 if __name__ == "__main__":
     main()
