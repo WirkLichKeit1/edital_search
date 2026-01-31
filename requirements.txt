@@ -1,4 +1,5 @@
 requests
+dotenv
 beautifulsoup4
 pypdf
 unidecode
