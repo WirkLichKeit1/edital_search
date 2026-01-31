@@ -4,6 +4,7 @@ from unidecode import unidecode
 from bs4 import BeautifulSoup
 import threading
 import requests
+import certifi
 import json
 import os
 import urllib3
