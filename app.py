@@ -253,7 +253,7 @@ async def auto(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # MAIN
 # =============================
 
-def rodar_bo():
+def rodar_bot():
     print("🤖 Bot rodando...")
 
     app = Application.builder().token(TOKEN).build()
