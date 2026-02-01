@@ -23,7 +23,7 @@ flask_app = Flask(__name__)
 URL = "https://www.pe.senai.br/editais/"
 ARQUIVO = "editais_cabo_ti.json"
 
-# Coloque seu token aqui
+# token bot api. no .env: TOKEN=SEU_TOKEN
 TOKEN = os.getenv("BOT_TOKEN")
 
 # Cidade alvo
@@ -253,6 +253,7 @@ async def auto(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # MAIN
 # =============================
 
+# rota principal: http://127.0.1:10000/
 @flask_app.route('/')
 def home():
     return "Rodando..."
@@ -262,6 +263,7 @@ def rodar_flask():
     print(f"Servidor rodando na porta: {port}")
     flask_app.run(host="0.0.0.0", port=port)
 
+# função principal para rodar bot + flask (função secundária)
 def main():
     t = threading.Thread(target=rodar_flask)
     t.start()
