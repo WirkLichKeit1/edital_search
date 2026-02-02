@@ -233,7 +233,7 @@ async def job_diario(context: ContextTypes.DEFAULT_TYPE):
                 )
                 await context.bot.send_message(chat_id=chat_id, text=msg)
         else:
-            msg = "Nenhum edital novo encontrado."
+            msg = "BUSCA DIÁRIA REALIZADA. Nenhum edital novo encontrado."
             await context.bot.send_message(chat_id=chat_id, text=msg)
     except Exception as e:
         print(f"Erro ao executar busca diária: {e}")
@@ -246,7 +246,7 @@ async def auto(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     context.job_queue.run_repeating(
         job_diario,
-        interval=30,  # 24h
+        interval=86400,  # 24h
         first=10,
         chat_id=chat_id
     )
