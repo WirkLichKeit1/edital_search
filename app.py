@@ -220,17 +220,25 @@ async def buscar(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # =============================
 
 async def job_diario(context: ContextTypes.DEFAULT_TYPE):
-    chat_id = context.job.chat_id
-    novos = buscar_novos_editais()
+    try:
+        chat_id = context.job.chat_id
+        novos = buscar_novos_editais()
 
-    if novos:
-        for e in novos:
-            msg = (
-                f"🚨 Novo edital CABO + TI!\n\n"
-                f"📄 {e['titulo']}\n"
-                f"🔗 {e['link']}"
-            )
+        if novos:
+            for e in novos:
+                msg = (
+                    f"🚨 Novo edital CABO + TI!\n\n"
+                    f"📄 {e['titulo']}\n"
+                    f"🔗 {e['link']}"
+                )
+                await context.bot.send_message(chat_id=chat_id, text=msg)
+        else:
+            msg = "Nenhum edital novo encontrado."
             await context.bot.send_message(chat_id=chat_id, text=msg)
+    except Exception as e:
+        print(f"Erro ao executar busca diária: {e}")
+        msg = f"Erro ao executar busca diária: {e}"
+        await context.bot.send_message(chat_id=chat_id, text=msg)
 
 
 async def auto(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -238,7 +246,7 @@ async def auto(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     context.job_queue.run_repeating(
         job_diario,
-        interval=86400,  # 24h
+        interval=30,  # 24h
         first=10,
         chat_id=chat_id
     )
