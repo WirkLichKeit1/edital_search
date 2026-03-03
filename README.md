@@ -1,75 +1,125 @@
-# 🤖 SENAI Edital Monitor Bot
+# Bot SENAI Editais
 
-Bot para Telegram integrado com Flask que monitora automaticamente o site de editais do SENAI-PE, filtrando oportunidades para a cidade do **Cabo de Santo Agostinho** na área de **TI**.
-
-## 📋 Sobre o Projeto
-
-O script realiza uma varredura (web scraping) no site oficial do SENAI-PE, analisa os títulos dos editais e, caso necessário, "lê" o conteúdo interno dos PDFs para identificar cursos de tecnologia, notificando o utilizador via Telegram.
+Bot para Telegram que monitora automaticamente os editais do [SENAI-PE](https://www.pe.senai.br/editais/), filtrando por cidade e área de TI. Quando um edital relevante é encontrado, o bot envia uma notificação com o link direto para o PDF.
 
 ---
 
-## ⚙️ Explicação das Funções
+## Funcionalidades
 
-O código está dividido em blocos lógicos que funcionam como uma esteira de processamento:
-
-### 1. Coleta e Filtragem Inicial
-
-* **`pegar_editais()`**: Acessa a URL do SENAI e extrai todos os links `<a>` que apontam para arquivos PDF e começam com a palavra "Edital".
-* **`edital_eh_cabo(titulo)`**: Normaliza o título (remove acentos e espaços) e verifica se a palavra "cabo" está presente, garantindo que o edital é da localidade correta.
-* **`titulo_indica_ti(titulo)`**: Verifica se o próprio nome do arquivo já menciona termos como "Desenvolvimento", "Redes" ou "Informática", agilizando o processo.
-
-### 2. Inspeção Profunda (Análise de PDF)
-
-* **`baixar_pdf(url_pdf)`**: Descarrega o ficheiro PDF para uma pasta temporária para que o script possa analisar o seu conteúdo.
-* **`extrair_texto_pdf(arquivo)`**: Utiliza a biblioteca `pypdf` para converter o conteúdo visual do PDF em texto pesquisável.
-* **`pdf_contem_ti(texto_pdf)`**: Varre o texto extraído em busca de qualquer termo da lista de TI, permitindo encontrar vagas mesmo quando o título do edital é genérico.
-
-### 3. Lógica de Negócio e Persistência
-
-* **`buscar_novos_editais()`**: É a função central. Ela coordena os filtros, ignora editais já processados (consultando o ficheiro `editais_cabo_ti.json`) e atualiza a base de dados local com as novas descobertas.
-
-### 4. Interface do Telegram
-
-* **`start()`**: Comando inicial que apresenta as opções ao utilizador.
-* **`buscar()`**: Aciona manualmente a varredura do site e reporta os resultados encontrados no momento.
-* **`auto()` e `job_diario()**`: Configuram uma rotina agendada (Job Queue) para que o bot trabalhe sozinho a cada 24 horas, notificando apenas se houver novidades.
-
-### 5. Infraestrutura
-
-* **`rodar_flask()`**: Mantém um servidor HTTP ativo. Isto é essencial para evitar que plataformas de hospedagem (como o Render) desliguem o bot por inatividade.
-* **`main()`**: Utiliza *threading* para correr o servidor Flask e o Bot do Telegram simultaneamente.
+- Scraping automático da página de editais do SENAI-PE
+- Filtro por cidade (padrão: Cabo de Santo Agostinho)
+- Filtro por área de TI — verifica o título e, se necessário, o conteúdo do PDF
+- Banco de dados local para evitar notificações duplicadas
+- Busca automática a cada 24 horas
+- Endpoint HTTP para health check (compatível com Render e Railway)
 
 ---
 
-## 🛠️ Instalação e Uso
+## Requisitos
 
-1. **Instale as dependências:**
+- Python 3.11+
+- Token de bot do Telegram (obtido via [@BotFather](https://t.me/BotFather))
+
+---
+
+## Instalação
+
 ```bash
-pip install flask pypdf unidecode beautifulsoup4 requests python-telegram-bot python-dotenv
+git clone https://github.com/seu-usuario/senai-bot.git
+cd senai-bot
 
+python -m venv venv
+source venv/bin/activate  # Windows: venv\Scripts\activate
+
+pip install -r requirements.txt
 ```
 
+Crie o arquivo `.env` baseado no exemplo:
 
-2. **Configure o ficheiro `.env`:**
+```bash
+cp .env.example .env
+```
+
+Preencha as variáveis:
+
 ```env
 BOT_TOKEN=seu_token_aqui
 PORT=10000
-
 ```
-
-
-3. **Inicie o bot:**
-```bash
-python nome_do_arquivo.py
-
-```
-
-
 
 ---
 
-## 🤖 Comandos Disponíveis
+## Uso
 
-* `/start` - Inicia o bot.
-* `/buscar` - Procura editais manualmente.
-* `/auto` - Ativa a verificação automática diária.
+```bash
+python app.py
+```
+
+### Comandos disponíveis no Telegram
+
+| Comando | Descrição |
+|---|---|
+| `/buscar` | Verifica novos editais agora |
+| `/listar` | Exibe os editais aceitos |
+| `/status` | Mostra estatísticas do banco de dados |
+| `/auto` | Ativa a busca automática a cada 24h |
+| `/parar` | Desativa a busca automática |
+| `/ajuda` | Exibe a lista de comandos |
+
+---
+
+## Como funciona o filtro
+
+Para cada edital encontrado na página, o bot aplica a seguinte lógica:
+
+1. **Cidade** — o título do edital deve conter o nome da cidade configurada. Se não, é ignorado.
+2. **Título** — se o título já menciona um curso de TI, o edital é aceito diretamente.
+3. **PDF** — se o título for genérico, o bot baixa o PDF e verifica o conteúdo. O edital é aceito se algum curso de TI for mencionado.
+
+Editais já analisados (aceitos ou rejeitados) são salvos em `editais_cabo_ti.json` para não serem reprocessados.
+
+---
+
+## Configuração
+
+As principais configurações ficam no topo do `app.py`:
+
+```python
+URL_EDITAIS    = "https://www.pe.senai.br/editais/"
+CIDADE_ALVO    = "cabo"
+INTERVALO_AUTO = 86_400   # segundos (24h)
+MAX_RETRIES    = 3
+```
+
+Para monitorar outra cidade, basta alterar `CIDADE_ALVO`. Para adicionar termos de busca, edite a lista `TI_TERMOS`.
+
+---
+
+## Deploy (Render / Railway)
+
+O servidor Flask sobe automaticamente na porta definida pela variável de ambiente `PORT`. As plataformas de hospedagem definem essa variável por padrão.
+
+Rotas disponíveis:
+
+- `GET /` — confirma que o serviço está no ar
+- `GET /health` — retorna estatísticas do banco de dados em JSON
+
+---
+
+## Estrutura do projeto
+
+```
+senai-bot/
+├── app.py                # Código principal
+├── requirements.txt      # Dependências
+├── .env.example          # Modelo de variáveis de ambiente
+├── .env                  # Variáveis locais (não versionar)
+├── editais_cabo_ti.json  # Banco de dados local (gerado em runtime)
+└── bot.log               # Log de execução (gerado em runtime)
+```
+
+---
+
+## Licença
+
+MIT
