@@ -1,7 +1,12 @@
 """
 Bot SENAI Editais - Versão Inteligente
 Monitora editais do SENAI-PE filtrando por cidade e área de TI.
-Inclui monitoramento de disponibilidade, logs verbosos e comandos extras.
+
+Lógica do /auto (job unificado):
+  - A cada 5min: checa se o site está online (leve, sem scraping)
+  - Quando o site VOLTA: notifica imediatamente e dispara busca completa
+  - Quando o site CAI: notifica imediatamente
+  - A cada 24h: busca completa de editais (só se o site estiver online)
 """
 
 import json
@@ -9,7 +14,7 @@ import logging
 import os
 import tempfile
 import time
-from datetime import datetime, timedelta
+from datetime import datetime
 from pathlib import Path
 
 import requests
@@ -48,16 +53,15 @@ logger = logging.getLogger(__name__)
 # Configurações
 # ─────────────────────────────────────────────
 
-URL_EDITAIS             = "https://www.pe.senai.br/editais/"
-URL_PORTAL              = "https://sge.pe.senai.br"
-ARQUIVO_DB              = Path("editais_cabo_ti.json")
-TOKEN                   = os.getenv("BOT_TOKEN")
-CIDADE_ALVO             = "cabo"
-INTERVALO_AUTO          = 86_400      # 24h em segundos
-INTERVALO_MONITOR       = 300         # 5 minutos — checa se site voltou
-REQUEST_TIMEOUT         = 30
-MAX_RETRIES             = 3
-BACKOFF_OFFLINE_HORAS   = 6           # quando offline, tenta a cada 6h no lugar de 24h
+URL_EDITAIS          = "https://www.pe.senai.br/editais/"
+URL_PORTAL           = "https://sge.pe.senai.br"
+ARQUIVO_DB           = Path("editais_cabo_ti.json")
+TOKEN                = os.getenv("BOT_TOKEN")
+CIDADE_ALVO          = "cabo"
+INTERVALO_MONITOR    = 300        # 5min — ping leve para saber se o site voltou
+INTERVALO_BUSCA      = 86_400     # 24h — busca completa de editais
+REQUEST_TIMEOUT      = 30
+MAX_RETRIES          = 3
 
 TI_TERMOS: list[str] = [
     "desenvolvimento de sistemas",
@@ -87,7 +91,6 @@ TI_TERMOS: list[str] = [
 # ─────────────────────────────────────────────
 
 def carregar_db() -> dict:
-    """Carrega o banco de dados local de editais já processados."""
     if ARQUIVO_DB.exists():
         try:
             return json.loads(ARQUIVO_DB.read_text(encoding="utf-8"))
@@ -102,12 +105,11 @@ def carregar_db() -> dict:
         "historico_disponibilidade": [],
         "total_buscas": 0,
         "total_pdfs_baixados": 0,
+        "ultima_busca_completa": None,
     }
 
 
 def salvar_db(db: dict) -> None:
-    """Salva o banco de dados local."""
-    db["ultima_busca"] = datetime.now().isoformat()
     ARQUIVO_DB.write_text(
         json.dumps(db, indent=2, ensure_ascii=False), encoding="utf-8"
     )
@@ -115,21 +117,15 @@ def salvar_db(db: dict) -> None:
 
 def registrar_disponibilidade(db: dict, online: bool) -> bool:
     """
-    Atualiza o estado de disponibilidade do site no DB.
-    Retorna True se o estado MUDOU (ex: voltou do offline).
+    Atualiza estado de disponibilidade.
+    Retorna True se o estado MUDOU (caiu ou voltou).
     """
     estava_online = db.get("site_online")
     db["site_online"] = online
 
     if online and estava_online is False:
-        # Site voltou!
         offline_desde = db.get("site_offline_desde")
-        duracao = ""
-        if offline_desde:
-            delta = datetime.now() - datetime.fromisoformat(offline_desde)
-            h, m = divmod(int(delta.total_seconds()), 3600)
-            m = m // 60
-            duracao = f"{h}h{m:02d}min"
+        duracao = _calcular_duracao(offline_desde) if offline_desde else "?"
         db["site_offline_desde"] = None
         db["historico_disponibilidade"].append({
             "evento": "voltou",
@@ -137,30 +133,44 @@ def registrar_disponibilidade(db: dict, online: bool) -> bool:
             "ficou_offline_por": duracao,
         })
         salvar_db(db)
-        return True  # MUDANÇA: offline → online
+        return True
 
     if not online and estava_online is not False:
-        # Site caiu agora
         db["site_offline_desde"] = datetime.now().isoformat()
         db["historico_disponibilidade"].append({
             "evento": "caiu",
             "em": datetime.now().isoformat(),
         })
         salvar_db(db)
-        return True  # MUDANÇA: online → offline
+        return True
 
-    return False  # sem mudança
+    return False
+
+
+def _calcular_duracao(desde_iso: str) -> str:
+    delta = datetime.now() - datetime.fromisoformat(desde_iso)
+    total = int(delta.total_seconds())
+    dias = total // 86400
+    horas = (total % 86400) // 3600
+    minutos = (total % 3600) // 60
+    if dias > 0:
+        return f"{dias}d {horas}h{minutos:02d}min"
+    if horas > 0:
+        return f"{horas}h{minutos:02d}min"
+    return f"{minutos}min"
+
+
+def tempo_offline(db: dict) -> str:
+    offline_desde = db.get("site_offline_desde")
+    return _calcular_duracao(offline_desde) if offline_desde else "desconhecido"
 
 
 # ─────────────────────────────────────────────
-# Verificação de disponibilidade
+# Verificação de disponibilidade (ping leve)
 # ─────────────────────────────────────────────
 
 def checar_site(url: str = URL_EDITAIS) -> tuple[bool, str]:
-    """
-    Verifica se o site está acessível.
-    Retorna (online: bool, mensagem: str).
-    """
+    """Ping rápido (timeout 10s). Retorna (online, mensagem)."""
     try:
         r = requests.get(
             url,
@@ -179,37 +189,14 @@ def checar_site(url: str = URL_EDITAIS) -> tuple[bool, str]:
         return False, f"Erro desconhecido ❌: {exc}"
 
 
-def tempo_offline(db: dict) -> str:
-    """Retorna string legível de quanto tempo o site está offline."""
-    offline_desde = db.get("site_offline_desde")
-    if not offline_desde:
-        return "desconhecido"
-    delta = datetime.now() - datetime.fromisoformat(offline_desde)
-    total = int(delta.total_seconds())
-    dias = total // 86400
-    horas = (total % 86400) // 3600
-    minutos = (total % 3600) // 60
-    if dias > 0:
-        return f"{dias}d {horas}h{minutos:02d}min"
-    if horas > 0:
-        return f"{horas}h{minutos:02d}min"
-    return f"{minutos}min"
-
-
 # ─────────────────────────────────────────────
 # Requisições com retry
 # ─────────────────────────────────────────────
 
-def fazer_request(
-    url: str,
-    stream: bool = False,
-    progresso_cb=None,
-) -> requests.Response | None:
+def fazer_request(url: str, stream: bool = False) -> requests.Response | None:
     """GET com retry exponencial e SSL desativado (site legado)."""
     for tentativa in range(1, MAX_RETRIES + 1):
         try:
-            if progresso_cb and tentativa > 1:
-                progresso_cb(f"⏳ Tentativa {tentativa}/{MAX_RETRIES}...")
             response = requests.get(
                 url,
                 verify=False,
@@ -236,23 +223,18 @@ def fazer_request(
 # ─────────────────────────────────────────────
 
 def pegar_editais() -> list[dict]:
-    """Coleta todos os links de editais PDF na página do SENAI-PE."""
     response = fazer_request(URL_EDITAIS)
     if not response:
         return []
-
     soup = BeautifulSoup(response.text, "html.parser")
     editais: list[dict] = []
-
     for link in soup.find_all("a", href=True):
         titulo = link.get_text(strip=True)
         href: str = link["href"]
-
         if titulo.lower().startswith("edital") and ".pdf" in href.lower():
             if not href.startswith("http"):
                 href = requests.compat.urljoin(URL_EDITAIS, href)
             editais.append({"titulo": titulo, "link": href})
-
     logger.info("%d edital(is) encontrado(s) no site.", len(editais))
     return editais
 
@@ -269,13 +251,7 @@ def edital_eh_cidade(titulo: str) -> bool:
     return CIDADE_ALVO in _normalizar(titulo)
 
 
-def contem_ti(texto: str) -> bool:
-    t = _normalizar(texto)
-    return any(termo in t for termo in TI_TERMOS)
-
-
 def termos_ti_encontrados(texto: str) -> list[str]:
-    """Retorna quais termos de TI foram encontrados no texto."""
     t = _normalizar(texto)
     return [termo for termo in TI_TERMOS if termo in t]
 
@@ -285,22 +261,17 @@ def termos_ti_encontrados(texto: str) -> list[str]:
 # ─────────────────────────────────────────────
 
 def extrair_texto_pdf(url_pdf: str) -> str | None:
-    """Baixa o PDF em arquivo temporário e extrai o texto."""
     response = fazer_request(url_pdf, stream=True)
     if not response:
         return None
-
     try:
         with tempfile.NamedTemporaryFile(suffix=".pdf", delete=False) as tmp:
             for chunk in response.iter_content(chunk_size=8192):
                 tmp.write(chunk)
             tmp_path = tmp.name
-
         reader = PdfReader(tmp_path)
-        texto = " ".join(
-            (pagina.extract_text() or "") for pagina in reader.pages
-        )
-        logger.info("  PDF extraído: %d páginas, %d chars", len(reader.pages), len(texto))
+        texto = " ".join((p.extract_text() or "") for p in reader.pages)
+        logger.info("  PDF: %d páginas, %d chars", len(reader.pages), len(texto))
         return texto
     except Exception as exc:
         logger.error("Erro ao processar PDF %s: %s", url_pdf, exc)
@@ -313,13 +284,13 @@ def extrair_texto_pdf(url_pdf: str) -> str | None:
 
 
 # ─────────────────────────────────────────────
-# Lógica principal de busca
+# Busca completa de editais
 # ─────────────────────────────────────────────
 
 def buscar_novos_editais(progresso_cb=None) -> dict:
     """
-    Retorna dict com resultados detalhados da busca.
-    progresso_cb: função opcional chamada com string de status.
+    Faz scraping e filtragem completa. Persiste no DB.
+    progresso_cb: callable(str) opcional para logs em tempo real.
     """
     def log(msg: str):
         logger.info(msg)
@@ -328,16 +299,10 @@ def buscar_novos_editais(progresso_cb=None) -> dict:
 
     db = carregar_db()
     db["total_buscas"] = db.get("total_buscas", 0) + 1
-
-    # Checar disponibilidade primeiro
-    log("🌐 Verificando disponibilidade do site...")
-    online, motivo_check = checar_site()
-    mudou = registrar_disponibilidade(db, online)
+    db["ultima_busca_completa"] = datetime.now().isoformat()
+    db["ultima_busca"] = datetime.now().isoformat()
 
     resultado = {
-        "site_online": online,
-        "motivo_check": motivo_check,
-        "mudou_estado": mudou,
         "novos_aceitos": [],
         "novos_rejeitados": [],
         "erros": [],
@@ -346,18 +311,11 @@ def buscar_novos_editais(progresso_cb=None) -> dict:
         "pdfs_baixados": 0,
     }
 
-    if not online:
-        offline_ha = tempo_offline(db)
-        log(f"❌ Site indisponível há {offline_ha}. Motivo: {motivo_check}")
-        salvar_db(db)
-        return resultado
-
-    log(f"✅ Site online. Coletando editais...")
-
     links_conhecidos: set[str] = {
         e["link"] for e in db["aceitos"] + db["rejeitados"]
     }
 
+    log("📄 Coletando editais da página...")
     editais_site = pegar_editais()
     resultado["total_site"] = len(editais_site)
 
@@ -366,10 +324,7 @@ def buscar_novos_editais(progresso_cb=None) -> dict:
         salvar_db(db)
         return resultado
 
-    log(f"📄 {len(editais_site)} edital(is) na página. Analisando...")
-
-    novos_aceitos: list[dict] = []
-    novos_rejeitados: list[dict] = []
+    log(f"📋 {len(editais_site)} edital(is) encontrado(s). Analisando...")
 
     for i, edital in enumerate(editais_site, 1):
         titulo = edital["titulo"]
@@ -387,28 +342,30 @@ def buscar_novos_editais(progresso_cb=None) -> dict:
             log(f"  ⏭ Ignorado — {motivo}")
             entry = {**edital, "motivo": motivo, "rejeitado_em": datetime.now().isoformat()}
             db["rejeitados"].append(entry)
-            novos_rejeitados.append(entry)
+            resultado["novos_rejeitados"].append(entry)
             continue
 
-        # 2) Título menciona TI diretamente?
+        # 2) Título menciona TI?
         termos = termos_ti_encontrados(titulo)
         if termos:
             log(f"  ✅ Aceito pelo título — termos: {', '.join(termos)}")
-            edital["aceito_em"] = datetime.now().isoformat()
-            edital["encontrado_em"] = "titulo"
-            edital["termos_ti"] = termos
+            edital.update({
+                "aceito_em": datetime.now().isoformat(),
+                "encontrado_em": "titulo",
+                "termos_ti": termos,
+            })
             db["aceitos"].append(edital)
-            novos_aceitos.append(edital)
+            resultado["novos_aceitos"].append(edital)
             continue
 
-        # 3) Verificar conteúdo do PDF
-        log(f"  📥 Título genérico. Baixando PDF para análise...")
+        # 3) Verificar PDF
+        log("  📥 Título genérico. Baixando PDF para análise...")
         resultado["pdfs_baixados"] += 1
         db["total_pdfs_baixados"] = db.get("total_pdfs_baixados", 0) + 1
         texto_pdf = extrair_texto_pdf(link)
 
         if texto_pdf is None:
-            msg = f"Não foi possível baixar/analisar o PDF: {link}"
+            msg = f"Não foi possível analisar o PDF: {link}"
             log(f"  ⚠️ {msg}")
             resultado["erros"].append(msg)
             continue
@@ -416,64 +373,51 @@ def buscar_novos_editais(progresso_cb=None) -> dict:
         termos = termos_ti_encontrados(texto_pdf)
         if termos:
             log(f"  ✅ Aceito pelo PDF — termos: {', '.join(termos[:3])}")
-            edital["aceito_em"] = datetime.now().isoformat()
-            edital["encontrado_em"] = "pdf"
-            edital["termos_ti"] = termos
+            edital.update({
+                "aceito_em": datetime.now().isoformat(),
+                "encontrado_em": "pdf",
+                "termos_ti": termos,
+            })
             db["aceitos"].append(edital)
-            novos_aceitos.append(edital)
+            resultado["novos_aceitos"].append(edital)
         else:
             motivo = "sem termos de TI (título e PDF verificados)"
             log(f"  ❌ Rejeitado — {motivo}")
             entry = {**edital, "motivo": motivo, "rejeitado_em": datetime.now().isoformat()}
             db["rejeitados"].append(entry)
-            novos_rejeitados.append(entry)
-
-    resultado["novos_aceitos"]    = novos_aceitos
-    resultado["novos_rejeitados"] = novos_rejeitados
+            resultado["novos_rejeitados"].append(entry)
 
     salvar_db(db)
-
     log(
-        f"\n📊 Busca concluída — "
-        f"✅ {len(novos_aceitos)} aceito(s), "
-        f"❌ {len(novos_rejeitados)} rejeitado(s), "
-        f"📥 {resultado['pdfs_baixados']} PDF(s) baixado(s), "
+        f"\n📊 Concluído — ✅ {len(resultado['novos_aceitos'])} aceito(s), "
+        f"❌ {len(resultado['novos_rejeitados'])} rejeitado(s), "
+        f"📥 {resultado['pdfs_baixados']} PDF(s), "
         f"🔁 {resultado['ja_conhecidos']} já conhecidos."
     )
     return resultado
 
 
 def reanalisar_rejeitados() -> dict:
-    """
-    Re-analisa editais rejeitados por 'sem_ti' ou motivo genérico.
-    Útil quando novos termos são adicionados à lista TI_TERMOS.
-    """
+    """Re-analisa rejeitados por conteúdo (não por cidade) com a lista atual de termos."""
     db = carregar_db()
-    reanalise = {"promovidos": [], "mantidos": 0}
-
-    candidatos = [
-        e for e in db["rejeitados"]
-        if "cidade" not in e.get("motivo", "")
-    ]
-
+    promovidos = []
+    candidatos = [e for e in db["rejeitados"] if "cidade" not in e.get("motivo", "")]
     for edital in candidatos:
         termos = termos_ti_encontrados(edital.get("titulo", ""))
         if termos:
-            edital["aceito_em"] = datetime.now().isoformat()
-            edital["encontrado_em"] = "reanalise_titulo"
-            edital["termos_ti"] = termos
+            edital.update({
+                "aceito_em": datetime.now().isoformat(),
+                "encontrado_em": "reanalise_titulo",
+                "termos_ti": termos,
+            })
             edital.pop("motivo", None)
             edital.pop("rejeitado_em", None)
             db["aceitos"].append(edital)
             db["rejeitados"].remove(edital)
-            reanalise["promovidos"].append(edital)
-        else:
-            reanalise["mantidos"] += 1
-
-    if reanalise["promovidos"]:
+            promovidos.append(edital)
+    if promovidos:
         salvar_db(db)
-
-    return reanalise
+    return {"promovidos": promovidos, "mantidos": len(candidatos) - len(promovidos)}
 
 
 # ─────────────────────────────────────────────
@@ -481,19 +425,17 @@ def reanalisar_rejeitados() -> dict:
 # ─────────────────────────────────────────────
 
 def _escapar_md(texto: str) -> str:
-    """Escapa caracteres especiais do MarkdownV2 do Telegram."""
-    caracteres = r"_*[]()~`>#+-=|{}.!"
-    for c in caracteres:
+    for c in r"_*[]()~`>#+-=|{}.!":
         texto = texto.replace(c, f"\\{c}")
     return texto
 
 
 def formatar_edital(edital: dict) -> str:
-    onde = edital.get("encontrado_em", "?")
-    termos = edital.get("termos_ti", [])
+    onde       = edital.get("encontrado_em", "?")
+    termos     = edital.get("termos_ti", [])
+    badge_map  = {"titulo": "📌 título", "pdf": "📄 PDF", "reanalise_titulo": "🔄 reanálise"}
+    badge      = badge_map.get(onde, onde)
     termos_str = ", ".join(termos[:3]) if termos else "—"
-    badge = "📌 título" if onde == "titulo" else "📄 PDF"
-
     return (
         f"🎓 *Novo edital encontrado\\!*\n\n"
         f"📋 {_escapar_md(edital['titulo'])}\n"
@@ -503,13 +445,8 @@ def formatar_edital(edital: dict) -> str:
     )
 
 
-async def _enviar_progresso(
-    update: Update,
-    linhas: list[str],
-    msg_id: int | None = None,
-) -> int:
-    """Edita ou envia nova mensagem de progresso. Retorna message_id."""
-    texto = "\n".join(linhas[-20:])  # últimas 20 linhas
+async def _enviar_e_editar(update: Update, linhas: list[str], msg_id: int | None) -> int:
+    texto = "\n".join(linhas[-20:])
     if len(texto) > 4096:
         texto = "…\n" + texto[-4090:]
     try:
@@ -520,12 +457,33 @@ async def _enviar_progresso(
                 text=texto,
             )
             return msg_id
-        else:
-            msg = await update.message.reply_text(texto)
-            return msg.message_id
     except Exception:
-        msg = await update.message.reply_text(texto)
-        return msg.message_id
+        pass
+    msg = await update.message.reply_text(texto)
+    return msg.message_id
+
+
+async def _enviar_resultado_busca(send_fn, resultado: dict, prefixo: str = "🔍") -> None:
+    """Envia resumo de busca. send_fn deve aceitar (text, **kwargs)."""
+    novos = resultado["novos_aceitos"]
+    if novos:
+        await send_fn(
+            f"{prefixo} *{len(novos)} novo\\(s\\) edital\\(is\\) de TI encontrado\\(s\\)\\!*",
+            parse_mode=ParseMode.MARKDOWN_V2,
+        )
+        for edital in novos:
+            await send_fn(
+                formatar_edital(edital),
+                parse_mode=ParseMode.MARKDOWN_V2,
+                disable_web_page_preview=True,
+            )
+    else:
+        await send_fn(
+            f"{prefixo} *Busca concluída\\.* Nenhum edital novo de TI\\.\n"
+            f"📊 {resultado['total_site']} no site, "
+            f"{resultado['ja_conhecidos']} já conhecidos\\.",
+            parse_mode=ParseMode.MARKDOWN_V2,
+        )
 
 
 # ─────────────────────────────────────────────
@@ -538,15 +496,14 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         "Monitoro os editais do SENAI\\-PE e aviso quando surgir "
         "algo para *Cabo de Santo Agostinho* na área de *TI*\\.\n\n"
         "📋 *Comandos disponíveis:*\n"
-        "/buscar — Busca novos editais agora\n"
+        "/buscar — Busca editais agora\n"
         "/checar — Verifica se o site está online\n"
-        "/listar — Exibe todos os editais aceitos\n"
-        "/rejeitados — Exibe editais rejeitados\n"
-        "/status — Painel completo de informações\n"
+        "/listar — Exibe editais aceitos\n"
+        "/rejeitados — Exibe editais rejeitados e motivos\n"
+        "/status — Painel completo\n"
         "/forcar — Re\\-analisa editais rejeitados\n"
-        "/auto — Ativa busca automática \\(24h\\)\n"
-        "/monitor — Ativa monitor de disponibilidade \\(5min\\)\n"
-        "/parar — Desativa todas as tarefas automáticas\n"
+        "/auto — Ativa modo automático \\(monitor \\+ busca\\)\n"
+        "/parar — Desativa o modo automático\n"
         "/ajuda — Exibe esta mensagem",
         parse_mode=ParseMode.MARKDOWN_V2,
     )
@@ -557,15 +514,11 @@ async def cmd_ajuda(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
 
 async def cmd_checar(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Verifica se o site está online e mostra detalhes."""
-    msg = await update.message.reply_text("🌐 Verificando site do SENAI\\-PE\\.\\.\\.", parse_mode=ParseMode.MARKDOWN_V2)
+    msg = await update.message.reply_text("🌐 Verificando\\.\\.\\.", parse_mode=ParseMode.MARKDOWN_V2)
 
     db = carregar_db()
-
-    # Checar site principal + portal do aluno
-    online_site, status_site   = checar_site(URL_EDITAIS)
+    online_site,   status_site   = checar_site(URL_EDITAIS)
     online_portal, status_portal = checar_site(URL_PORTAL)
-
     mudou = registrar_disponibilidade(db, online_site)
 
     offline_info = ""
@@ -577,88 +530,65 @@ async def cmd_checar(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
         f"📋 Site de editais: {_escapar_md(status_site)}\n"
         f"🎓 Portal do aluno: {_escapar_md(status_portal)}"
         f"{offline_info}\n\n"
-        f"🕒 Verificado em: `{_escapar_md(datetime.now().strftime('%d/%m/%Y %H:%M:%S'))}`"
+        f"🕒 `{_escapar_md(datetime.now().strftime('%d/%m/%Y %H:%M:%S'))}`"
     )
-
     if mudou and online_site:
-        texto += "\n\n🎉 *O site voltou\\!* Agora você pode usar /buscar\\."
+        texto += "\n\n🎉 *O site voltou\\!* Use /buscar\\."
 
     await msg.edit_text(texto, parse_mode=ParseMode.MARKDOWN_V2)
 
 
 async def cmd_buscar(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Busca novos editais com logs verbosos em tempo real."""
-    log_linhas: list[str] = ["🔍 Iniciando busca de editais..."]
+    """Busca manual com progresso em tempo real."""
+    # Checar antes de tentar scraping
+    online, motivo = checar_site()
+    db = carregar_db()
+    registrar_disponibilidade(db, online)
+
+    if not online:
+        await update.message.reply_text(
+            f"❌ *Site indisponível*\n"
+            f"Motivo: {_escapar_md(motivo)}\n"
+            f"Offline há: `{_escapar_md(tempo_offline(db))}`\n\n"
+            f"Use /auto para ser notificado quando o site voltar\\.",
+            parse_mode=ParseMode.MARKDOWN_V2,
+        )
+        return
+
+    log_linhas: list[str] = ["🔍 Iniciando busca..."]
     msg_id = None
     last_update = time.time()
+    loop = asyncio.get_event_loop()
 
     async def progresso(linha: str):
         nonlocal msg_id, last_update
         log_linhas.append(linha)
         agora = time.time()
-        # Throttle: atualiza no máximo a cada 2s para não spammar a API
-        if agora - last_update > 2 or "concluída" in linha or "indisponível" in linha:
-            msg_id = await _enviar_progresso(update, log_linhas, msg_id)
+        if agora - last_update > 2 or any(k in linha for k in ("Concluído", "concluído", "⚠️")):
+            msg_id = await _enviar_e_editar(update, log_linhas, msg_id)
             last_update = agora
 
     def progresso_sync(linha: str):
-        asyncio.get_event_loop().call_soon_threadsafe(
-            lambda: asyncio.ensure_future(progresso(linha))
-        )
+        asyncio.run_coroutine_threadsafe(progresso(linha), loop)
 
-    resultado = await asyncio.get_event_loop().run_in_executor(
+    resultado = await loop.run_in_executor(
         None, lambda: buscar_novos_editais(progresso_cb=progresso_sync)
     )
 
-    # Aguarda último update de progresso
     await asyncio.sleep(0.5)
-    msg_id = await _enviar_progresso(update, log_linhas, msg_id)
-
-    # Resultado final
-    novos = resultado["novos_aceitos"]
-
-    if not resultado["site_online"]:
-        offline_ha = tempo_offline(carregar_db())
-        await update.message.reply_text(
-            f"⚠️ *Site indisponível\\.*\n"
-            f"Offline há `{_escapar_md(offline_ha)}`\\.\n"
-            f"Use /monitor para ser avisado quando voltar\\.",
-            parse_mode=ParseMode.MARKDOWN_V2,
-        )
-        return
-
-    if not novos:
-        await update.message.reply_text(
-            f"✅ Busca concluída\\. Nenhum edital *novo* de TI encontrado\\.\n"
-            f"📊 {resultado['total_site']} edital\\(is\\) no site, "
-            f"{resultado['ja_conhecidos']} já conhecidos\\.",
-            parse_mode=ParseMode.MARKDOWN_V2,
-        )
-        return
-
-    await update.message.reply_text(
-        f"🎉 *{len(novos)} novo\\(s\\) edital\\(is\\) de TI encontrado\\(s\\)\\!*",
-        parse_mode=ParseMode.MARKDOWN_V2,
-    )
-    for edital in novos:
-        await update.message.reply_text(
-            formatar_edital(edital),
-            parse_mode=ParseMode.MARKDOWN_V2,
-            disable_web_page_preview=True,
-        )
+    await _enviar_e_editar(update, log_linhas, msg_id)
+    await _enviar_resultado_busca(update.message.reply_text, resultado, "🔍")
 
 
 async def cmd_listar(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     db = carregar_db()
     aceitos = db.get("aceitos", [])
-
     if not aceitos:
         await update.message.reply_text(
-            "📭 Nenhum edital aceito ainda\\. Use /buscar para checar\\.",
+            "📭 Nenhum edital aceito ainda\\. Use /buscar\\.",
             parse_mode=ParseMode.MARKDOWN_V2,
         )
         return
-
     await update.message.reply_text(
         f"📋 *{len(aceitos)} edital\\(is\\) aceito\\(s\\):*",
         parse_mode=ParseMode.MARKDOWN_V2,
@@ -672,24 +602,20 @@ async def cmd_listar(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
 
 
 async def cmd_rejeitados(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Exibe os editais rejeitados com o motivo."""
     db = carregar_db()
     rejeitados = db.get("rejeitados", [])
-
     if not rejeitados:
-        await update.message.reply_text("📭 Nenhum edital rejeitado registrado.")
+        await update.message.reply_text("📭 Nenhum edital rejeitado registrado\\.", parse_mode=ParseMode.MARKDOWN_V2)
         return
 
-    # Agrupar por motivo
     por_motivo: dict[str, list] = {}
     for e in rejeitados:
-        m = e.get("motivo", "desconhecido")
-        por_motivo.setdefault(m, []).append(e)
+        por_motivo.setdefault(e.get("motivo", "desconhecido"), []).append(e)
 
     linhas = [f"🗂 *{len(rejeitados)} edital\\(is\\) rejeitado\\(s\\):*\n"]
     for motivo, lista in por_motivo.items():
-        linhas.append(f"*Motivo: {_escapar_md(motivo)}* \\({len(lista)}\\)")
-        for e in lista[-5:]:  # últimos 5 por motivo
+        linhas.append(f"*{_escapar_md(motivo)}* \\({len(lista)}\\)")
+        for e in lista[-5:]:
             linhas.append(f"• {_escapar_md(e['titulo'])}")
         linhas.append("")
 
@@ -702,9 +628,9 @@ async def cmd_rejeitados(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
 
 async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     db = carregar_db()
-    ultima = db.get("ultima_busca") or "nunca"
-    site_ok = db.get("site_online")
+    chat_id = update.effective_chat.id
 
+    site_ok = db.get("site_online")
     if site_ok is True:
         site_str = "Online ✅"
     elif site_ok is False:
@@ -712,61 +638,57 @@ async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
     else:
         site_str = "Desconhecido ❓"
 
-    # Últimos eventos de disponibilidade
+    ultima = db.get("ultima_busca_completa") or "nunca"
+    if ultima != "nunca":
+        ultima = ultima[:16].replace("T", " ")
+
+    jobs_ativos = (
+        context.job_queue.get_jobs_by_name(f"monitor_{chat_id}") or
+        context.job_queue.get_jobs_by_name(f"busca_{chat_id}")
+    )
+    auto_str = "Ativo ✅" if jobs_ativos else "Inativo ⏸"
+
     historico = db.get("historico_disponibilidade", [])[-3:]
     hist_str = ""
     for ev in reversed(historico):
         em = ev["em"][:16].replace("T", " ")
         if ev["evento"] == "voltou":
             dur = ev.get("ficou_offline_por", "?")
-            hist_str += f"\n  🟢 Voltou em {_escapar_md(em)} \\(ficou {_escapar_md(dur)} offline\\)"
+            hist_str += f"\n  🟢 Voltou em {_escapar_md(em)} \\(offline por {_escapar_md(dur)}\\)"
         else:
             hist_str += f"\n  🔴 Caiu em {_escapar_md(em)}"
 
     texto = (
         f"📊 *Painel do Bot SENAI*\n\n"
         f"🌐 Site: {_escapar_md(site_str)}\n"
+        f"⚙️ Modo automático: {_escapar_md(auto_str)}\n"
         f"✅ Aceitos: `{len(db.get('aceitos', []))}`\n"
         f"❌ Rejeitados: `{len(db.get('rejeitados', []))}`\n"
         f"🔍 Total de buscas: `{db.get('total_buscas', 0)}`\n"
         f"📥 PDFs analisados: `{db.get('total_pdfs_baixados', 0)}`\n"
-        f"🕒 Última busca: `{_escapar_md(ultima[:16].replace('T', ' ') if ultima != 'nunca' else 'nunca')}`\n"
+        f"🕒 Última busca: `{_escapar_md(ultima)}`\n"
         f"🌐 Fonte: [pe\\.senai\\.br/editais]({URL_EDITAIS})"
     )
-
     if hist_str:
         texto += f"\n\n📅 *Histórico recente:*{hist_str}"
 
-    await update.message.reply_text(
-        texto,
-        parse_mode=ParseMode.MARKDOWN_V2,
-        disable_web_page_preview=True,
-    )
+    await update.message.reply_text(texto, parse_mode=ParseMode.MARKDOWN_V2,
+                                    disable_web_page_preview=True)
 
 
 async def cmd_forcar(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Re-analisa editais rejeitados por conteúdo (não por cidade)."""
-    msg = await update.message.reply_text("🔄 Re\\-analisando editais rejeitados\\.\\.\\.", parse_mode=ParseMode.MARKDOWN_V2)
-
-    resultado = await asyncio.get_event_loop().run_in_executor(
-        None, reanalisar_rejeitados
-    )
-
+    msg = await update.message.reply_text("🔄 Re\\-analisando rejeitados\\.\\.\\.", parse_mode=ParseMode.MARKDOWN_V2)
+    resultado = await asyncio.get_event_loop().run_in_executor(None, reanalisar_rejeitados)
     promovidos = resultado["promovidos"]
     mantidos   = resultado["mantidos"]
-
     if not promovidos:
         await msg.edit_text(
-            f"🔄 Re\\-análise concluída\\.\n"
-            f"Nenhum edital foi reclassificado\\. "
-            f"{mantidos} mantido\\(s\\) como rejeitado\\(s\\)\\.",
+            f"🔄 Re\\-análise concluída\\. Nenhum promovido\\. {mantidos} mantido\\(s\\)\\.",
             parse_mode=ParseMode.MARKDOWN_V2,
         )
         return
-
     await msg.edit_text(
-        f"🎉 *{len(promovidos)} edital\\(is\\) promovido\\(s\\) para aceito\\!*\n"
-        f"{mantidos} mantido\\(s\\) como rejeitado\\(s\\)\\.",
+        f"🎉 *{len(promovidos)} edital\\(is\\) promovido\\(s\\)\\!* {mantidos} mantido\\(s\\)\\.",
         parse_mode=ParseMode.MARKDOWN_V2,
     )
     for edital in promovidos:
@@ -778,71 +700,72 @@ async def cmd_forcar(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
 
 
 async def cmd_auto(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """
+    Ativa o modo automático unificado com dois jobs independentes:
+
+    monitor_{chat_id}  — ping a cada 5min, notifica mudanças de estado,
+                         dispara busca imediata quando o site volta.
+
+    busca_{chat_id}    — busca completa a cada 24h, ignora silenciosamente
+                         se o site estiver offline (o monitor já cuida disso).
+    """
     chat_id = update.effective_chat.id
-    jobs = context.job_queue.get_jobs_by_name(f"auto_{chat_id}")
 
-    if jobs:
-        await update.message.reply_text("⏰ Busca automática já está ativa\\.", parse_mode=ParseMode.MARKDOWN_V2)
-        return
-
-    context.job_queue.run_repeating(
-        _job_diario,
-        interval=INTERVALO_AUTO,
-        first=10,
-        chat_id=chat_id,
-        name=f"auto_{chat_id}",
-        data=chat_id,
+    ja_ativo = (
+        context.job_queue.get_jobs_by_name(f"monitor_{chat_id}") or
+        context.job_queue.get_jobs_by_name(f"busca_{chat_id}")
     )
-    await update.message.reply_text(
-        "⏰ Busca automática *ativada\\!*\n"
-        "Verificarei novos editais a cada 24h\\.\n"
-        "Use /monitor para também monitorar quando o site voltar\\.",
-        parse_mode=ParseMode.MARKDOWN_V2,
-    )
-
-
-async def cmd_monitor(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Ativa monitoramento de disponibilidade do site a cada 5 minutos."""
-    chat_id = update.effective_chat.id
-    jobs = context.job_queue.get_jobs_by_name(f"monitor_{chat_id}")
-
-    if jobs:
-        await update.message.reply_text("👁 Monitor já está ativo\\.", parse_mode=ParseMode.MARKDOWN_V2)
+    if ja_ativo:
+        await update.message.reply_text(
+            "⚙️ Modo automático já está ativo\\.\n"
+            "Use /status para ver o estado ou /parar para desativar\\.",
+            parse_mode=ParseMode.MARKDOWN_V2,
+        )
         return
 
     context.job_queue.run_repeating(
         _job_monitor,
         interval=INTERVALO_MONITOR,
-        first=5,
+        first=15,
         chat_id=chat_id,
         name=f"monitor_{chat_id}",
-        data=chat_id,
     )
+
+    context.job_queue.run_repeating(
+        _job_busca,
+        interval=INTERVALO_BUSCA,
+        first=30,
+        chat_id=chat_id,
+        name=f"busca_{chat_id}",
+    )
+
     await update.message.reply_text(
-        "👁 *Monitor ativado\\!*\n"
-        f"Verificarei o site a cada {INTERVALO_MONITOR // 60} minutos\\.\n"
-        "Você será notificado quando o site cair *ou voltar*\\.",
+        "⚙️ *Modo automático ativado\\!*\n\n"
+        f"👁 *Monitor* — verifica o site a cada {INTERVALO_MONITOR // 60}min\n"
+        "  → Notifica quando o site *cair* ou *voltar*\n"
+        "  → Quando voltar, já dispara uma busca imediatamente\n\n"
+        f"🔍 *Busca diária* — varredura completa a cada 24h\n"
+        "  → Só executa se o site estiver online\n"
+        "  → Se offline, aguarda o monitor detectar a volta\n\n"
+        "Use /parar para desativar\\.",
         parse_mode=ParseMode.MARKDOWN_V2,
     )
 
 
 async def cmd_parar(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     chat_id = update.effective_chat.id
-    parados = []
-
-    for prefixo in ("auto_", "monitor_"):
-        jobs = context.job_queue.get_jobs_by_name(f"{prefixo}{chat_id}")
-        for job in jobs:
+    parados = 0
+    for nome in (f"monitor_{chat_id}", f"busca_{chat_id}"):
+        for job in context.job_queue.get_jobs_by_name(nome):
             job.schedule_removal()
-            parados.append(prefixo.rstrip("_"))
-
+            parados += 1
     if not parados:
-        await update.message.reply_text("Não há tarefas automáticas ativas\\.", parse_mode=ParseMode.MARKDOWN_V2)
+        await update.message.reply_text(
+            "Não há tarefas automáticas ativas\\.", parse_mode=ParseMode.MARKDOWN_V2
+        )
         return
-
-    nomes = " e ".join(parados)
     await update.message.reply_text(
-        f"🛑 Tarefas desativadas: *{_escapar_md(nomes)}*\\.",
+        "🛑 *Modo automático desativado\\.*\nUse /auto para reativar\\.",
         parse_mode=ParseMode.MARKDOWN_V2,
     )
 
@@ -851,65 +774,12 @@ async def cmd_parar(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 # Jobs automáticos
 # ─────────────────────────────────────────────
 
-async def _job_diario(context: ContextTypes.DEFAULT_TYPE) -> None:
-    chat_id = context.job.chat_id
-    logger.info("Job diário iniciado para chat_id=%s", chat_id)
-
-    try:
-        resultado = await asyncio.get_event_loop().run_in_executor(
-            None, buscar_novos_editais
-        )
-
-        if not resultado["site_online"]:
-            db = carregar_db()
-            offline_ha = tempo_offline(db)
-            await context.bot.send_message(
-                chat_id=chat_id,
-                text=(
-                    f"⏰ *Busca automática realizada\\.*\n\n"
-                    f"❌ Site indisponível há `{_escapar_md(offline_ha)}`\\.\n"
-                    f"Ative /monitor para ser avisado quando voltar\\."
-                ),
-                parse_mode=ParseMode.MARKDOWN_V2,
-            )
-            return
-
-        novos = resultado["novos_aceitos"]
-        if novos:
-            await context.bot.send_message(
-                chat_id=chat_id,
-                text=f"⏰ *Busca automática:* {len(novos)} novo\\(s\\) edital\\(is\\) encontrado\\(s\\)\\!",
-                parse_mode=ParseMode.MARKDOWN_V2,
-            )
-            for edital in novos:
-                await context.bot.send_message(
-                    chat_id=chat_id,
-                    text=formatar_edital(edital),
-                    parse_mode=ParseMode.MARKDOWN_V2,
-                    disable_web_page_preview=True,
-                )
-        else:
-            await context.bot.send_message(
-                chat_id=chat_id,
-                text=(
-                    f"⏰ *Busca automática realizada\\.*\n"
-                    f"Nenhum edital novo encontrado\\.\n"
-                    f"📊 {resultado['total_site']} no site, "
-                    f"{resultado['ja_conhecidos']} já conhecidos\\."
-                ),
-                parse_mode=ParseMode.MARKDOWN_V2,
-            )
-    except Exception as exc:
-        logger.error("Erro no job diário: %s", exc)
-        await context.bot.send_message(
-            chat_id=chat_id,
-            text=f"⚠️ Erro na busca automática: {_escapar_md(str(exc))}",
-            parse_mode=ParseMode.MARKDOWN_V2,
-        )
-
-
 async def _job_monitor(context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Verifica disponibilidade e notifica apenas em mudanças de estado."""
+    """
+    Ping leve a cada 5min.
+    Notifica APENAS em mudanças de estado (caiu / voltou).
+    Quando volta: dispara busca completa imediatamente.
+    """
     chat_id = context.job.chat_id
     db = carregar_db()
 
@@ -917,18 +787,37 @@ async def _job_monitor(context: ContextTypes.DEFAULT_TYPE) -> None:
     mudou = registrar_disponibilidade(db, online)
 
     if not mudou:
-        return  # Sem mudança, silêncio total
+        return  # silêncio — sem mudança
 
     if online:
+        # Recuperar duração do offline do histórico
+        offline_por = ""
+        historico = db.get("historico_disponibilidade", [])
+        if historico and historico[-1]["evento"] == "voltou":
+            dur = historico[-1].get("ficou_offline_por", "?")
+            offline_por = f"\nEstava offline há {_escapar_md(dur)}\\."
+
+        logger.info("Site voltou. Disparando busca imediata para chat_id=%s", chat_id)
+
         await context.bot.send_message(
             chat_id=chat_id,
             text=(
-                "🟢 *O site do SENAI\\-PE voltou\\!*\n\n"
-                "O site estava offline e agora está acessível\\.\n"
-                "Use /buscar para verificar novos editais\\."
+                f"🟢 *O site do SENAI\\-PE voltou\\!*"
+                f"{offline_por}\n\n"
+                f"🔍 Iniciando busca de editais automaticamente\\.\\.\\."
             ),
             parse_mode=ParseMode.MARKDOWN_V2,
         )
+
+        resultado = await asyncio.get_event_loop().run_in_executor(
+            None, buscar_novos_editais
+        )
+
+        async def send(txt, **kw):
+            await context.bot.send_message(chat_id=chat_id, text=txt, **kw)
+
+        await _enviar_resultado_busca(send, resultado, "🟢")
+
     else:
         await context.bot.send_message(
             chat_id=chat_id,
@@ -941,15 +830,54 @@ async def _job_monitor(context: ContextTypes.DEFAULT_TYPE) -> None:
         )
 
 
+async def _job_busca(context: ContextTypes.DEFAULT_TYPE) -> None:
+    """
+    Busca completa a cada 24h.
+    Se o site estiver offline: ignora silenciosamente.
+    O _job_monitor já trata a notificação de queda/retorno e
+    dispara a busca imediata quando o site voltar.
+    """
+    chat_id = context.job.chat_id
+    logger.info("Job de busca diária para chat_id=%s", chat_id)
+
+    online, _ = checar_site(URL_EDITAIS)
+    db = carregar_db()
+    registrar_disponibilidade(db, online)
+
+    if not online:
+        logger.info("Busca diária ignorada: site offline há %s", tempo_offline(db))
+        return  # sem mensagem — o monitor já cuida disso
+
+    try:
+        resultado = await asyncio.get_event_loop().run_in_executor(
+            None, buscar_novos_editais
+        )
+
+        async def send(txt, **kw):
+            await context.bot.send_message(chat_id=chat_id, text=txt, **kw)
+
+        await _enviar_resultado_busca(send, resultado, "⏰")
+
+    except Exception as exc:
+        logger.error("Erro no job de busca diária: %s", exc)
+        await context.bot.send_message(
+            chat_id=chat_id,
+            text=f"⚠️ Erro na busca automática: {_escapar_md(str(exc))}",
+            parse_mode=ParseMode.MARKDOWN_V2,
+        )
+
+
 # ─────────────────────────────────────────────
 # Flask (health check para Render / Railway)
 # ─────────────────────────────────────────────
 
 flask_app = Flask(__name__)
 
+
 @flask_app.route("/")
 def home():
     return jsonify({"status": "ok", "bot": "SENAI Editais"})
+
 
 @flask_app.route("/health")
 def health():
@@ -962,8 +890,9 @@ def health():
         "rejeitados": len(db.get("rejeitados", [])),
         "total_buscas": db.get("total_buscas", 0),
         "total_pdfs_baixados": db.get("total_pdfs_baixados", 0),
-        "ultima_busca": db.get("ultima_busca"),
+        "ultima_busca_completa": db.get("ultima_busca_completa"),
     })
+
 
 def rodar_flask() -> None:
     port = int(os.environ.get("PORT", 10000))
@@ -995,25 +924,22 @@ def main() -> None:
     app.add_handler(CommandHandler("status",     cmd_status))
     app.add_handler(CommandHandler("forcar",     cmd_forcar))
     app.add_handler(CommandHandler("auto",       cmd_auto))
-    app.add_handler(CommandHandler("monitor",    cmd_monitor))
     app.add_handler(CommandHandler("parar",      cmd_parar))
 
-    async def set_commands(app: Application) -> None:
-        await app.bot.set_my_commands([
+    async def set_commands(a: Application) -> None:
+        await a.bot.set_my_commands([
             BotCommand("buscar",     "Buscar novos editais agora"),
             BotCommand("checar",     "Verificar se o site está online"),
             BotCommand("listar",     "Listar editais aceitos"),
             BotCommand("rejeitados", "Ver editais rejeitados e motivos"),
             BotCommand("status",     "Painel completo de informações"),
             BotCommand("forcar",     "Re-analisar editais rejeitados"),
-            BotCommand("auto",       "Ativar busca automática (24h)"),
-            BotCommand("monitor",    "Monitorar disponibilidade do site"),
-            BotCommand("parar",      "Desativar tarefas automáticas"),
+            BotCommand("auto",       "Ativar modo automático (monitor + busca)"),
+            BotCommand("parar",      "Desativar modo automático"),
             BotCommand("ajuda",      "Exibir ajuda"),
         ])
 
     app.post_init = set_commands
-
     app.run_polling(allowed_updates=Update.ALL_TYPES)
 
 
