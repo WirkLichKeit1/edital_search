@@ -425,7 +425,8 @@ def reanalisar_rejeitados() -> dict:
 # ─────────────────────────────────────────────
 
 def _escapar_md(texto: str) -> str:
-    for c in r"_*[]()~`>#+-=|{}.!":
+    """Escapa todos os caracteres reservados do MarkdownV2."""
+    for c in r"\_*[]()~`>#+-=|{}.!":
         texto = texto.replace(c, f"\\{c}")
     return texto
 
@@ -466,6 +467,8 @@ async def _enviar_e_editar(update: Update, linhas: list[str], msg_id: int | None
 async def _enviar_resultado_busca(send_fn, resultado: dict, prefixo: str = "🔍") -> None:
     """Envia resumo de busca. send_fn deve aceitar (text, **kwargs)."""
     novos = resultado["novos_aceitos"]
+    total_site   = resultado["total_site"]
+    ja_conhecidos = resultado["ja_conhecidos"]
     if novos:
         await send_fn(
             f"{prefixo} *{len(novos)} novo\\(s\\) edital\\(is\\) de TI encontrado\\(s\\)\\!*",
@@ -480,8 +483,8 @@ async def _enviar_resultado_busca(send_fn, resultado: dict, prefixo: str = "🔍
     else:
         await send_fn(
             f"{prefixo} *Busca concluída\\.* Nenhum edital novo de TI\\.\n"
-            f"📊 {resultado['total_site']} no site, "
-            f"{resultado['ja_conhecidos']} já conhecidos\\.",
+            f"📊 {total_site} no site, "
+            f"{ja_conhecidos} já conhecidos\\.",
             parse_mode=ParseMode.MARKDOWN_V2,
         )
 
@@ -540,7 +543,6 @@ async def cmd_checar(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
 
 async def cmd_buscar(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Busca manual com progresso em tempo real."""
-    # Checar antes de tentar scraping
     online, motivo = checar_site()
     db = carregar_db()
     registrar_disponibilidade(db, online)
@@ -605,7 +607,9 @@ async def cmd_rejeitados(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     db = carregar_db()
     rejeitados = db.get("rejeitados", [])
     if not rejeitados:
-        await update.message.reply_text("📭 Nenhum edital rejeitado registrado\\.", parse_mode=ParseMode.MARKDOWN_V2)
+        await update.message.reply_text(
+            "📭 Nenhum edital rejeitado registrado\\.", parse_mode=ParseMode.MARKDOWN_V2
+        )
         return
 
     por_motivo: dict[str, list] = {}
@@ -634,6 +638,7 @@ async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
     if site_ok is True:
         site_str = "Online ✅"
     elif site_ok is False:
+        # FIX: escape the dynamic tempo_offline string; parens come from _escapar_md
         site_str = f"Offline ❌ \\(há {_escapar_md(tempo_offline(db))}\\)"
     else:
         site_str = "Desconhecido ❓"
@@ -646,6 +651,7 @@ async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
         context.job_queue.get_jobs_by_name(f"monitor_{chat_id}") or
         context.job_queue.get_jobs_by_name(f"busca_{chat_id}")
     )
+    # FIX: plain strings with no reserved chars — no escaping needed here
     auto_str = "Ativo ✅" if jobs_ativos else "Inativo ⏸"
 
     historico = db.get("historico_disponibilidade", [])[-3:]
@@ -654,14 +660,17 @@ async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
         em = ev["em"][:16].replace("T", " ")
         if ev["evento"] == "voltou":
             dur = ev.get("ficou_offline_por", "?")
-            hist_str += f"\n  🟢 Voltou em {_escapar_md(em)} \\(offline por {_escapar_md(dur)}\\)"
+            hist_str += (
+                f"\n  🟢 Voltou em {_escapar_md(em)}"
+                f" \\(offline por {_escapar_md(dur)}\\)"
+            )
         else:
             hist_str += f"\n  🔴 Caiu em {_escapar_md(em)}"
 
     texto = (
         f"📊 *Painel do Bot SENAI*\n\n"
-        f"🌐 Site: {_escapar_md(site_str)}\n"
-        f"⚙️ Modo automático: {_escapar_md(auto_str)}\n"
+        f"🌐 Site: {site_str}\n"
+        f"⚙️ Modo automático: {auto_str}\n"
         f"✅ Aceitos: `{len(db.get('aceitos', []))}`\n"
         f"❌ Rejeitados: `{len(db.get('rejeitados', []))}`\n"
         f"🔍 Total de buscas: `{db.get('total_buscas', 0)}`\n"
@@ -672,12 +681,17 @@ async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
     if hist_str:
         texto += f"\n\n📅 *Histórico recente:*{hist_str}"
 
-    await update.message.reply_text(texto, parse_mode=ParseMode.MARKDOWN_V2,
-                                    disable_web_page_preview=True)
+    await update.message.reply_text(
+        texto,
+        parse_mode=ParseMode.MARKDOWN_V2,
+        disable_web_page_preview=True,
+    )
 
 
 async def cmd_forcar(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    msg = await update.message.reply_text("🔄 Re\\-analisando rejeitados\\.\\.\\.", parse_mode=ParseMode.MARKDOWN_V2)
+    msg = await update.message.reply_text(
+        "🔄 Re\\-analisando rejeitados\\.\\.\\.", parse_mode=ParseMode.MARKDOWN_V2
+    )
     resultado = await asyncio.get_event_loop().run_in_executor(None, reanalisar_rejeitados)
     promovidos = resultado["promovidos"]
     mantidos   = resultado["mantidos"]
@@ -700,15 +714,6 @@ async def cmd_forcar(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
 
 
 async def cmd_auto(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """
-    Ativa o modo automático unificado com dois jobs independentes:
-
-    monitor_{chat_id}  — ping a cada 5min, notifica mudanças de estado,
-                         dispara busca imediata quando o site volta.
-
-    busca_{chat_id}    — busca completa a cada 24h, ignora silenciosamente
-                         se o site estiver offline (o monitor já cuida disso).
-    """
     chat_id = update.effective_chat.id
 
     ja_ativo = (
@@ -775,11 +780,6 @@ async def cmd_parar(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 # ─────────────────────────────────────────────
 
 async def _job_monitor(context: ContextTypes.DEFAULT_TYPE) -> None:
-    """
-    Ping leve a cada 5min.
-    Notifica APENAS em mudanças de estado (caiu / voltou).
-    Quando volta: dispara busca completa imediatamente.
-    """
     chat_id = context.job.chat_id
     db = carregar_db()
 
@@ -787,10 +787,9 @@ async def _job_monitor(context: ContextTypes.DEFAULT_TYPE) -> None:
     mudou = registrar_disponibilidade(db, online)
 
     if not mudou:
-        return  # silêncio — sem mudança
+        return
 
     if online:
-        # Recuperar duração do offline do histórico
         offline_por = ""
         historico = db.get("historico_disponibilidade", [])
         if historico and historico[-1]["evento"] == "voltou":
@@ -819,6 +818,7 @@ async def _job_monitor(context: ContextTypes.DEFAULT_TYPE) -> None:
         await _enviar_resultado_busca(send, resultado, "🟢")
 
     else:
+        # FIX: motivo comes from checar_site() and may contain reserved chars like ()
         await context.bot.send_message(
             chat_id=chat_id,
             text=(
@@ -831,12 +831,6 @@ async def _job_monitor(context: ContextTypes.DEFAULT_TYPE) -> None:
 
 
 async def _job_busca(context: ContextTypes.DEFAULT_TYPE) -> None:
-    """
-    Busca completa a cada 24h.
-    Se o site estiver offline: ignora silenciosamente.
-    O _job_monitor já trata a notificação de queda/retorno e
-    dispara a busca imediata quando o site voltar.
-    """
     chat_id = context.job.chat_id
     logger.info("Job de busca diária para chat_id=%s", chat_id)
 
@@ -846,7 +840,7 @@ async def _job_busca(context: ContextTypes.DEFAULT_TYPE) -> None:
 
     if not online:
         logger.info("Busca diária ignorada: site offline há %s", tempo_offline(db))
-        return  # sem mensagem — o monitor já cuida disso
+        return
 
     try:
         resultado = await asyncio.get_event_loop().run_in_executor(
