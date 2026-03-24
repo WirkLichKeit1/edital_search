@@ -12,9 +12,9 @@ from telegram import Update
 from telegram.constants import ParseMode
 from telegram.ext import ContextTypes
 
-from bot.database import get_user
+from bot.database import get_user, tempo_offline
 from bot.formatters import esc, formatar_edital, enviar_resultado_busca, atualizar_progresso
-from bot.scraper import checar_site, buscar_novos_editais, reanalisar_rejeitados, tempo_offline
+from bot.scraper import checar_site, buscar_novos_editais, reanalisar_rejeitados
 from config import Settings
 
 

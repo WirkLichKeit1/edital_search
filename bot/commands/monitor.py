@@ -9,9 +9,9 @@ from telegram import Update
 from telegram.constants import ParseMode
 from telegram.ext import ContextTypes
 
-from bot.database import get_user, registrar_disponibilidade
+from bot.database import get_user, registrar_disponibilidade, tempo_offline
 from bot.formatters import esc
-from bot.scraper import checar_site, tempo_offline
+from bot.scraper import checar_site
 from config import Settings
 
 

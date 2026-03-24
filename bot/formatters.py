@@ -15,7 +15,7 @@ from telegram import Message
 from telegram.constants import ParseMode
 
 from bot.database import Edital, UserData
-from bot.scraper import tempo_offline as _tempo_offline  # re-exportado por conveniência
+from bot.database import tempo_offline as _tempo_offline  # re-exportado por conveniência
 
 logger = logging.getLogger(__name__)
 
