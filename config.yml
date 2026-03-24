@@ -1,0 +1,41 @@
+# ─────────────────────────────────────────────
+# Configurações padrão do Bot SENAI Editais
+# Estes valores são usados quando um novo usuário inicia o bot.
+# Cada usuário pode sobrescrever via comandos do Telegram.
+# ─────────────────────────────────────────────
+
+# Cidade filtrada nos títulos dos editais
+cidade_padrao: cabo
+
+# Intervalos de tempo (em segundos)
+intervalo_monitor: 300      # 5min  — ping leve para checar se o site está online
+intervalo_busca: 86400      # 24h   — varredura completa de editais
+
+# URLs monitoradas
+url_editais: "https://www.pe.senai.br/editais/"
+url_portal:  "https://sge.pe.senai.br"
+
+# Termos padrão para filtrar editais de TI
+# Adicione ou remova termos conforme necessário.
+# Usuários podem personalizar via /addtermo e /rmtermo no Telegram.
+termos_padrao:
+  - desenvolvimento de sistemas
+  - tecnico em desenvolvimento de sistemas
+  - informatica
+  - tecnico em informatica
+  - informatica para internet
+  - redes de computadores
+  - tecnico em redes
+  - programacao
+  - programador
+  - desenvolvimento web
+  - software
+  - banco de dados
+  - seguranca da informacao
+  - ciberseguranca
+  - tecnologia da informacao
+  - ti
+  - suporte tecnico
+  - manutencao de computadores
+  - analise e desenvolvimento
+  - ads
