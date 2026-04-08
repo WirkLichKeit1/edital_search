@@ -28,8 +28,16 @@ _MD_RESERVED = r"\_*[]()~`>#+-=|{}.!"
 # ─────────────────────────────────────────────
 
 
-def esc(texto: str) -> str:
-    """Escapa todos os caracteres reservados do MarkdownV2."""
+def esc(texto: str | None) -> str:
+    """
+    Escapa todos os caracteres reservados do MarkdownV2.
+
+    FIX: aceita None explicitamente — vários campos opcionais do Edital
+    (motivo, encontrado_em) podem ser None e eram passados diretamente
+    ao esc(), causando AttributeError em runtime.
+    """
+    if texto is None:
+        return ""
     for c in _MD_RESERVED:
         texto = texto.replace(c, f"\\{c}")
     return texto
@@ -170,7 +178,7 @@ async def atualizar_progresso(
     update,
     linhas: list[str],
     msg_id: int | None,
-    last_update: list[float],   # lista com um elemento para mutabilidade via closure
+    last_update: list[float],
     intervalo: float = 2.0,
 ) -> int:
     """
