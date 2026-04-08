@@ -32,6 +32,13 @@ logger = logging.getLogger(__name__)
 # Cabeçalho padrão para todas as requisições
 _HEADERS = {"User-Agent": "Mozilla/5.0 (SENAI-Bot/3.0)"}
 
+# Títulos de link que são considerados genéricos (não descritivos do edital)
+_TITULOS_GENERICOS = {
+    "download", "pdf", "clique aqui", "baixar", "abrir",
+    "ver", "link", "acesse", "download pdf", "baixar pdf",
+    "abrir pdf", "ver pdf",
+}
+
 
 # ─────────────────────────────────────────────
 # HTTP — ping e fetch com retry
@@ -71,11 +78,6 @@ async def _fetch(url: str, timeout: int, stream: bool = False) -> httpx.Response
         headers=_HEADERS,
         follow_redirects=True,
     ) as client:
-        if stream:
-            # Para PDFs, retornamos o conteúdo binário direto
-            r = await client.get(url, timeout=timeout)
-            r.raise_for_status()
-            return r
         r = await client.get(url, timeout=timeout)
         r.raise_for_status()
         return r
@@ -104,40 +106,41 @@ async def fazer_request(
 
 def _extrair_contexto_link(tag) -> str:
     """
-    Extrai texto de contexto ao redor de um link na página:
-    - Texto do elemento pai imediato (li, td, div, p, etc.)
-    - Texto do elemento avô, para estruturas mais aninhadas
+    Extrai texto de contexto do elemento pai imediato do link (li, td, p, div).
 
-    Isso cobre casos onde a cidade ou os termos de interesse ficam
-    fora do texto do <a> mas na mesma célula/item de lista, ex:
-      <li><a href="...">Edital 001</a> - Cabo de Santo Agostinho - Informática</li>
-      <td class="titulo">Edital 002 - TI</td><td><a href="...">PDF</a></td>
+    Sobe para o avô APENAS se o pai for um elemento inline pequeno (span, b, etc.)
+    sem texto próprio relevante — evita capturar o texto de contêineres grandes
+    (table, ul) que agrupam dezenas de editais ao mesmo tempo.
+
+    FIX: versão anterior subia sempre ao avô, fazendo com que um <tr> ou <ul>
+    com centenas de linhas de editais fosse retornado como "contexto" de cada
+    link individual — resultando em 700+ editais passando pelo filtro inicial.
     """
-    partes: list[str] = []
-
     pai = tag.parent
-    if pai:
-        partes.append(pai.get_text(separator=" ", strip=True))
+    if not pai:
+        return ""
 
-    avo = pai.parent if pai else None
-    if avo and avo.name not in ("body", "html", "[document]", None):
-        partes.append(avo.get_text(separator=" ", strip=True))
+    pai_texto = pai.get_text(separator=" ", strip=True)
 
-    return " ".join(partes)
+    # Sobe para o avô somente se o pai for inline e tiver pouco texto próprio
+    _INLINE = {"span", "b", "strong", "em", "i", "u", "a", "small"}
+    if pai.name in _INLINE or len(pai_texto) < 15:
+        avo = pai.parent
+        if avo and avo.name not in ("body", "html", "[document]", None):
+            return avo.get_text(separator=" ", strip=True)
+
+    return pai_texto
 
 
 async def pegar_editais(url_editais: str, timeout: int = 30) -> list[Edital]:
     """
     Coleta todos os links de editais PDF da página.
-    Retorna lista de Edital com titulo, link preenchidos e, quando disponível,
+    Retorna lista de Edital com titulo e link preenchidos e, quando disponível,
     texto_contexto anotado dinamicamente para uso posterior no pipeline de busca.
 
-    Melhorias em relação à versão anterior:
-    - Não exige mais que o texto do <a> comece com "edital": aceita qualquer
-      link PDF cujo texto ou contexto na página mencione "edital".
-    - Captura o texto ao redor do link (pai e avô no HTML) como contexto
-      adicional para filtragem por cidade e termos — sem precisar abrir o PDF.
-    - Deduplica links (mesmo PDF referenciado em vários lugares da página).
+    FIX: critério de entrada agora exige "edital" no texto do próprio <a>,
+    não no contexto combinado — impede que um contêiner grande (table/ul) com
+    a palavra "edital" faça centenas de links PDF passarem pelo filtro.
     """
     response = await fazer_request(url_editais, timeout=timeout)
     if not response:
@@ -155,12 +158,9 @@ async def pegar_editais(url_editais: str, timeout: int = 30) -> list[Edital]:
         if ".pdf" not in href.lower():
             continue
 
-        # Captura texto ao redor do link na página
-        contexto = _extrair_contexto_link(link)
-
-        # Aceita o link se "edital" aparecer no título do <a> OU no contexto da página
-        texto_combinado = f"{titulo} {contexto}".lower()
-        if "edital" not in texto_combinado:
+        # FIX: exige "edital" no texto do próprio <a>, não no contexto combinado.
+        # O contexto serve para enriquecer cidade/termos, não para liberar a entrada.
+        if "edital" not in titulo.lower():
             continue
 
         if not href.startswith("http"):
@@ -172,19 +172,18 @@ async def pegar_editais(url_editais: str, timeout: int = 30) -> list[Edital]:
             continue
         links_vistos.add(href)
 
+        # Captura texto ao redor do link na página para auxiliar filtragem
+        contexto = _extrair_contexto_link(link)
+
         # Prefere o título do <a> quando descritivo; usa contexto como fallback
-        # Considera genérico: títulos curtos ou que sejam apenas "download"/"pdf"/"clique aqui"
-        _TITULOS_GENERICOS = {"download", "pdf", "clique aqui", "baixar", "abrir", "ver", "link", "acesse"}
         titulo_lower = titulo.strip().lower()
         eh_generico = (
             len(titulo) < 20
             or titulo_lower in _TITULOS_GENERICOS
-            or titulo_lower.replace(" ", "") in {"downloadpdf", "baixarpdf", "abrir", "verpdf"}
         )
         titulo_final = contexto[:150].strip() if eh_generico else titulo
 
         edital = Edital(titulo=titulo_final, link=href)
-        # Anota o contexto da página como atributo dinâmico para uso no pipeline
         edital.texto_contexto = contexto  # type: ignore[attr-defined]
         editais.append(edital)
 
@@ -201,15 +200,29 @@ async def extrair_texto_pdf(url_pdf: str, timeout: int = 30) -> Optional[str]:
     """
     Baixa o PDF e extrai o texto de todas as páginas.
     Retorna None se o download ou a extração falhar.
+
+    FIX: limite de tamanho de download (10 MB) para evitar que PDFs
+    gigantes travem o bot ou estourem memória.
     """
     response = await fazer_request(url_pdf, timeout=timeout, stream=True)
     if not response:
         return None
 
+    # FIX: rejeita PDFs muito grandes antes de tentar processar
+    _MAX_PDF_BYTES = 10 * 1024 * 1024  # 10 MB
+    content = response.content
+    if len(content) > _MAX_PDF_BYTES:
+        logger.warning(
+            "PDF ignorado por exceder limite de tamanho (%d MB): %s",
+            len(content) // (1024 * 1024),
+            url_pdf,
+        )
+        return None
+
     tmp_path: Optional[str] = None
     try:
         with tempfile.NamedTemporaryFile(suffix=".pdf", delete=False) as tmp:
-            tmp.write(response.content)
+            tmp.write(content)
             tmp_path = tmp.name
 
         reader = PdfReader(tmp_path)
@@ -239,7 +252,7 @@ async def buscar_novos_editais(
     user: UserData,
     url_editais: str,
     timeout: int = 30,
-    progresso_cb: Optional[Callable[[str], None]] = None,
+    progresso_cb: Optional[Callable] = None,
 ) -> dict:
     """
     Faz scraping completo, filtra por cidade e termos de TI,
@@ -250,12 +263,17 @@ async def buscar_novos_editais(
       2. Filtro por termos — título do link OU texto de contexto da página
       3. Análise do PDF    — conteúdo completo do arquivo PDF
 
-    progresso_cb: callable(str) opcional para logs em tempo real no Telegram.
+    progresso_cb: callable(str) opcional — aceita tanto funções síncronas
+    quanto coroutines assíncronas (para uso direto no event loop do bot).
     """
-    def log(msg: str) -> None:
+    import inspect
+
+    async def log(msg: str) -> None:
         logger.info(msg)
         if progresso_cb:
-            progresso_cb(msg)
+            result = progresso_cb(msg)
+            if inspect.isawaitable(result):
+                await result
 
     resultado = {
         "novos_aceitos": [],
@@ -270,18 +288,21 @@ async def buscar_novos_editais(
     user.stats.total_buscas += 1
     user.ultima_busca_completa = datetime.now().isoformat()
 
+    # FIX: captura os links conhecidos UMA vez antes do loop — evita
+    # que um edital aceito numa iteração anterior seja reprocessado
+    # na mesma busca se pegar_editais retornar duplicatas residuais.
     links_conhecidos = user.links_conhecidos()
 
-    log("📄 Coletando editais da página...")
+    await log("📄 Coletando editais da página...")
     editais_site = await pegar_editais(url_editais, timeout=timeout)
     resultado["total_site"] = len(editais_site)
 
     if not editais_site:
-        log("⚠️ Nenhum edital encontrado na página.")
+        await log("⚠️ Nenhum edital encontrado na página.")
         salvar_user(chat_id, user)
         return resultado
 
-    log(f"📋 {len(editais_site)} edital(is) encontrado(s). Analisando...")
+    await log(f"📋 {len(editais_site)} edital(is) encontrado(s). Analisando...")
 
     cidade = user.config.cidade
     termos = user.config.termos
@@ -294,41 +315,42 @@ async def buscar_novos_editais(
         # Texto de contexto capturado da página (pode não existir em editais vindos do banco)
         contexto_pagina: str = getattr(edital, "texto_contexto", "")
 
-        log(f"\n🔎 [{i}/{len(editais_site)}] {edital.titulo}")
+        await log(f"\n🔎 [{i}/{len(editais_site)}] {edital.titulo}")
 
         # ── 1. Filtro de cidade ──────────────────────────────────────────────
-        # Verifica tanto no título do PDF quanto no texto ao redor do link na página
         cidade_no_titulo   = edital_eh_cidade(edital.titulo, cidade)
         cidade_no_contexto = edital_eh_cidade(contexto_pagina, cidade) if contexto_pagina else False
 
         if not cidade_no_titulo and not cidade_no_contexto:
             motivo = f"cidade (não contém '{cidade}')"
-            log(f"  ⏭ Ignorado — {motivo}")
+            await log(f"  ⏭ Ignorado — {motivo}")
             edital.motivo = motivo
             edital.rejeitado_em = datetime.now().isoformat()
             user.rejeitados.append(edital)
             resultado["novos_rejeitados"].append(edital)
+            # FIX: adiciona ao set local para não reprocessar na mesma execução
+            links_conhecidos.add(edital.link)
             continue
 
         if not cidade_no_titulo and cidade_no_contexto:
-            log(f"  📍 Cidade encontrada no contexto da página (não no título do PDF)")
+            await log("  📍 Cidade encontrada no contexto da página (não no título do PDF)")
 
         # ── 2. Filtro por termos no título ou contexto da página ─────────────
-        # Evita download do PDF quando os termos já aparecem no texto da página
         texto_pagina = f"{edital.titulo} {contexto_pagina}"
         achados = termos_encontrados(texto_pagina, termos)
         if achados:
             fonte = "título" if termos_encontrados(edital.titulo, termos) else "contexto da página"
-            log(f"  ✅ Aceito pelo {fonte} — termos: {', '.join(achados)}")
+            await log(f"  ✅ Aceito pelo {fonte} — termos: {', '.join(achados)}")
             edital.aceito_em = datetime.now().isoformat()
             edital.encontrado_em = "titulo"
             edital.termos_ti = achados
             user.aceitos.append(edital)
             resultado["novos_aceitos"].append(edital)
+            links_conhecidos.add(edital.link)
             continue
 
         # ── 3. Análise do PDF ────────────────────────────────────────────────
-        log("  📥 Título e contexto genéricos. Baixando PDF para análise...")
+        await log("  📥 Título e contexto genéricos. Baixando PDF para análise...")
         resultado["pdfs_baixados"] += 1
         user.stats.total_pdfs_baixados += 1
 
@@ -336,13 +358,20 @@ async def buscar_novos_editais(
 
         if texto_pdf is None:
             msg = f"Não foi possível analisar o PDF: {edital.link}"
-            log(f"  ⚠️ {msg}")
+            await log(f"  ⚠️ {msg}")
             resultado["erros"].append(msg)
+            # FIX: edital sem PDF analisável é rejeitado e persiste,
+            # evitando que seja tentado novamente em toda busca futura.
+            edital.motivo = "PDF inacessível ou ilegível"
+            edital.rejeitado_em = datetime.now().isoformat()
+            user.rejeitados.append(edital)
+            resultado["novos_rejeitados"].append(edital)
+            links_conhecidos.add(edital.link)
             continue
 
         achados = termos_encontrados(texto_pdf, termos)
         if achados:
-            log(f"  ✅ Aceito pelo PDF — termos: {', '.join(achados[:3])}")
+            await log(f"  ✅ Aceito pelo PDF — termos: {', '.join(achados[:3])}")
             edital.aceito_em = datetime.now().isoformat()
             edital.encontrado_em = "pdf"
             edital.termos_ti = achados
@@ -350,15 +379,17 @@ async def buscar_novos_editais(
             resultado["novos_aceitos"].append(edital)
         else:
             motivo = "sem termos de TI (título, contexto da página e PDF verificados)"
-            log(f"  ❌ Rejeitado — {motivo}")
+            await log(f"  ❌ Rejeitado — {motivo}")
             edital.motivo = motivo
             edital.rejeitado_em = datetime.now().isoformat()
             user.rejeitados.append(edital)
             resultado["novos_rejeitados"].append(edital)
 
+        links_conhecidos.add(edital.link)
+
     salvar_user(chat_id, user)
 
-    log(
+    await log(
         f"\n📊 Concluído — ✅ {len(resultado['novos_aceitos'])} aceito(s), "
         f"❌ {len(resultado['novos_rejeitados'])} rejeitado(s), "
         f"📥 {resultado['pdfs_baixados']} PDF(s), "
@@ -377,11 +408,14 @@ async def reanalisar_rejeitados(chat_id: int | str, user: UserData) -> dict:
     Re-analisa editais rejeitados por conteúdo (não por cidade)
     usando a lista de termos atual do usuário.
     Útil após o usuário adicionar novos termos via /addtermo.
+
+    FIX: itera sobre uma cópia da lista para evitar modificar a lista
+    enquanto itera sobre ela (RuntimeError: list changed size during iteration).
     """
     promovidos: list[Edital] = []
     candidatos = [e for e in user.rejeitados if e.motivo and "cidade" not in e.motivo]
 
-    for edital in candidatos:
+    for edital in candidatos:  # candidatos já é uma cópia — seguro iterar
         achados = termos_encontrados(edital.titulo, user.config.termos)
         if achados:
             edital.aceito_em = datetime.now().isoformat()
