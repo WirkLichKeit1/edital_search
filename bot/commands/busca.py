@@ -41,23 +41,24 @@ def setup(settings: Settings):
         log_linhas: list[str] = ["🔍 Iniciando busca..."]
         msg_id: list[int] = [0]
         last_update: list[float] = [time.time()]
-        loop = asyncio.get_event_loop()
 
+        # FIX: buscar_novos_editais é assíncrono e roda no mesmo event loop
+        # do bot — não precisa (nem deve) usar run_coroutine_threadsafe.
+        # A versão anterior criava uma referência ao loop antes de ele existir
+        # e chamava asyncio.run_coroutine_threadsafe de dentro do próprio loop,
+        # o que pode gerar deadlock ou silenciosamente não atualizar o progresso.
         async def progresso(linha: str) -> None:
             log_linhas.append(linha)
             msg_id[0] = await atualizar_progresso(
                 update, log_linhas, msg_id[0], last_update
             )
 
-        def progresso_sync(linha: str) -> None:
-            asyncio.run_coroutine_threadsafe(progresso(linha), loop)
-
         resultado = await buscar_novos_editais(
             chat_id=chat_id,
             user=user,
             url_editais=settings.url_editais,
             timeout=settings.request_timeout,
-            progresso_cb=progresso_sync,
+            progresso_cb=progresso,   # passa o coroutine diretamente
         )
 
         await asyncio.sleep(0.5)
