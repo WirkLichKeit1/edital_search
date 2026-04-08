@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import json
 import logging
+import threading
 from dataclasses import dataclass, field, asdict
 from datetime import datetime
 from pathlib import Path
@@ -16,6 +17,10 @@ from typing import Optional
 logger = logging.getLogger(__name__)
 
 ARQUIVO_DB = Path("data/db.json")
+
+# FIX: lock global para evitar corrida entre job_monitor e job_busca
+# (ambos podem chamar salvar_user/registrar_disponibilidade simultaneamente)
+_DB_LOCK = threading.Lock()
 
 
 # ─────────────────────────────────────────────
@@ -166,7 +171,11 @@ def _carregar_raw() -> dict:
 
 def _salvar_raw(raw: dict) -> None:
     ARQUIVO_DB.parent.mkdir(parents=True, exist_ok=True)
-    ARQUIVO_DB.write_text(json.dumps(raw, indent=2, ensure_ascii=False), encoding="utf-8")
+    # FIX: escrita atômica via arquivo temporário — evita DB corrompido
+    # se o processo for morto no meio de uma escrita.
+    tmp = ARQUIVO_DB.with_suffix(".tmp")
+    tmp.write_text(json.dumps(raw, indent=2, ensure_ascii=False), encoding="utf-8")
+    tmp.replace(ARQUIVO_DB)
 
 
 def get_user(chat_id: int | str, config_padrao: UserConfig) -> UserData:
@@ -174,24 +183,26 @@ def get_user(chat_id: int | str, config_padrao: UserConfig) -> UserData:
     Retorna os dados do usuário. Se não existir, cria com os padrões do config.yaml.
     Nunca retorna None — garante que o usuário sempre existe no banco após essa chamada.
     """
-    raw = _carregar_raw()
-    uid = str(chat_id)
+    with _DB_LOCK:
+        raw = _carregar_raw()
+        uid = str(chat_id)
 
-    if uid not in raw["users"]:
-        logger.info("Novo usuário criado: %s", uid)
-        user = UserData(config=config_padrao)
-        raw["users"][uid] = user.to_dict()
-        _salvar_raw(raw)
-        return user
+        if uid not in raw["users"]:
+            logger.info("Novo usuário criado: %s", uid)
+            user = UserData(config=config_padrao)
+            raw["users"][uid] = user.to_dict()
+            _salvar_raw(raw)
+            return user
 
-    return UserData.from_dict(raw["users"][uid])
+        return UserData.from_dict(raw["users"][uid])
 
 
 def salvar_user(chat_id: int | str, user: UserData) -> None:
     """Persiste os dados de um usuário no banco."""
-    raw = _carregar_raw()
-    raw["users"][str(chat_id)] = user.to_dict()
-    _salvar_raw(raw)
+    with _DB_LOCK:
+        raw = _carregar_raw()
+        raw["users"][str(chat_id)] = user.to_dict()
+        _salvar_raw(raw)
 
 
 def atualizar_config(chat_id: int | str, **kwargs) -> UserData:
@@ -199,19 +210,20 @@ def atualizar_config(chat_id: int | str, **kwargs) -> UserData:
     Atualiza campos da UserConfig de um usuário e persiste.
     Exemplo: atualizar_config(chat_id, cidade="recife")
     """
-    raw = _carregar_raw()
-    uid = str(chat_id)
-    user = UserData.from_dict(raw["users"][uid])
+    with _DB_LOCK:
+        raw = _carregar_raw()
+        uid = str(chat_id)
+        user = UserData.from_dict(raw["users"][uid])
 
-    for chave, valor in kwargs.items():
-        if hasattr(user.config, chave):
-            setattr(user.config, chave, valor)
-        else:
-            logger.warning("Campo desconhecido em UserConfig: %s", chave)
+        for chave, valor in kwargs.items():
+            if hasattr(user.config, chave):
+                setattr(user.config, chave, valor)
+            else:
+                logger.warning("Campo desconhecido em UserConfig: %s", chave)
 
-    raw["users"][uid] = user.to_dict()
-    _salvar_raw(raw)
-    return user
+        raw["users"][uid] = user.to_dict()
+        _salvar_raw(raw)
+        return user
 
 
 # ─────────────────────────────────────────────
@@ -220,31 +232,34 @@ def atualizar_config(chat_id: int | str, **kwargs) -> UserData:
 
 
 def adicionar_aceito(chat_id: int | str, edital: Edital) -> None:
-    raw = _carregar_raw()
-    uid = str(chat_id)
-    raw["users"][uid]["aceitos"].append(edital.to_dict())
-    _salvar_raw(raw)
+    with _DB_LOCK:
+        raw = _carregar_raw()
+        uid = str(chat_id)
+        raw["users"][uid]["aceitos"].append(edital.to_dict())
+        _salvar_raw(raw)
 
 
 def adicionar_rejeitado(chat_id: int | str, edital: Edital) -> None:
-    raw = _carregar_raw()
-    uid = str(chat_id)
-    raw["users"][uid]["rejeitados"].append(edital.to_dict())
-    _salvar_raw(raw)
+    with _DB_LOCK:
+        raw = _carregar_raw()
+        uid = str(chat_id)
+        raw["users"][uid]["rejeitados"].append(edital.to_dict())
+        _salvar_raw(raw)
 
 
 def promover_rejeitado(chat_id: int | str, edital: Edital) -> None:
     """Move um edital de rejeitados para aceitos."""
-    raw = _carregar_raw()
-    uid = str(chat_id)
+    with _DB_LOCK:
+        raw = _carregar_raw()
+        uid = str(chat_id)
 
-    raw["users"][uid]["rejeitados"] = [
-        e for e in raw["users"][uid]["rejeitados"] if e["link"] != edital.link
-    ]
-    edital.motivo = None
-    edital.rejeitado_em = None
-    raw["users"][uid]["aceitos"].append(edital.to_dict())
-    _salvar_raw(raw)
+        raw["users"][uid]["rejeitados"] = [
+            e for e in raw["users"][uid]["rejeitados"] if e["link"] != edital.link
+        ]
+        edital.motivo = None
+        edital.rejeitado_em = None
+        raw["users"][uid]["aceitos"].append(edital.to_dict())
+        _salvar_raw(raw)
 
 
 # ─────────────────────────────────────────────
@@ -274,34 +289,35 @@ def registrar_disponibilidade(chat_id: int | str, online: bool) -> bool:
     Atualiza o estado de disponibilidade do usuário.
     Retorna True se o estado MUDOU (site caiu ou voltou).
     """
-    raw = _carregar_raw()
-    uid = str(chat_id)
-    user = UserData.from_dict(raw["users"][uid])
+    with _DB_LOCK:
+        raw = _carregar_raw()
+        uid = str(chat_id)
+        user = UserData.from_dict(raw["users"][uid])
 
-    estava_online = user.site_online
-    user.site_online = online
+        estava_online = user.site_online
+        user.site_online = online
 
-    mudou = False
+        mudou = False
 
-    if online and estava_online is False:
-        offline_desde = user.site_offline_desde
-        duracao = _calcular_duracao(offline_desde) if offline_desde else "?"
-        user.site_offline_desde = None
-        user.historico_disponibilidade.append(EventoDisponibilidade(
-            evento="voltou",
-            em=datetime.now().isoformat(),
-            ficou_offline_por=duracao,
-        ))
-        mudou = True
+        if online and estava_online is False:
+            offline_desde = user.site_offline_desde
+            duracao = _calcular_duracao(offline_desde) if offline_desde else "?"
+            user.site_offline_desde = None
+            user.historico_disponibilidade.append(EventoDisponibilidade(
+                evento="voltou",
+                em=datetime.now().isoformat(),
+                ficou_offline_por=duracao,
+            ))
+            mudou = True
 
-    elif not online and estava_online is not False:
-        user.site_offline_desde = datetime.now().isoformat()
-        user.historico_disponibilidade.append(EventoDisponibilidade(
-            evento="caiu",
-            em=datetime.now().isoformat(),
-        ))
-        mudou = True
+        elif not online and estava_online is not False:
+            user.site_offline_desde = datetime.now().isoformat()
+            user.historico_disponibilidade.append(EventoDisponibilidade(
+                evento="caiu",
+                em=datetime.now().isoformat(),
+            ))
+            mudou = True
 
-    raw["users"][uid] = user.to_dict()
-    _salvar_raw(raw)
-    return mudou
+        raw["users"][uid] = user.to_dict()
+        _salvar_raw(raw)
+        return mudou
