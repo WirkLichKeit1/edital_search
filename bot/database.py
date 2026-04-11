@@ -22,6 +22,10 @@ ARQUIVO_DB = Path("data/db.json")
 # (ambos podem chamar salvar_user/registrar_disponibilidade simultaneamente)
 _DB_LOCK = threading.Lock()
 
+# Número de checks falhos consecutivos necessários para declarar o site offline.
+# Evita notificações por 503 transitórios que se resolvem sozinhos em segundos.
+LIMIAR_FALHAS = 3
+
 
 # ─────────────────────────────────────────────
 # Modelos
@@ -120,6 +124,7 @@ class UserData:
     site_offline_desde: Optional[str] = None
     ultima_busca_completa: Optional[str] = None
     historico_disponibilidade: list[EventoDisponibilidade] = field(default_factory=list)
+    falhas_consecutivas: int = 0  # checks falhos seguidos; só declara offline ao atingir LIMIAR_FALHAS
 
     def links_conhecidos(self) -> set[str]:
         return {e.link for e in self.aceitos + self.rejeitados}
@@ -134,6 +139,7 @@ class UserData:
             "site_offline_desde": self.site_offline_desde,
             "ultima_busca_completa": self.ultima_busca_completa,
             "historico_disponibilidade": [ev.to_dict() for ev in self.historico_disponibilidade],
+            "falhas_consecutivas": self.falhas_consecutivas,
         }
 
     @staticmethod
@@ -150,6 +156,7 @@ class UserData:
                 EventoDisponibilidade.from_dict(ev)
                 for ev in d.get("historico_disponibilidade", [])
             ],
+            falhas_consecutivas=d.get("falhas_consecutivas", 0),
         )
 
 
@@ -287,7 +294,13 @@ def tempo_offline(user: UserData) -> str:
 def registrar_disponibilidade(chat_id: int | str, online: bool) -> bool:
     """
     Atualiza o estado de disponibilidade do usuário.
-    Retorna True se o estado MUDOU (site caiu ou voltou).
+
+    Lógica de debounce: falhas transitórias (ex: HTTP 503 esporádico) não
+    declaram o site como offline imediatamente. O site só é marcado offline
+    após LIMIAR_FALHAS checks falhos consecutivos, evitando o ciclo falso de
+    notificações "caiu / voltou" a cada instabilidade passageira.
+
+    Retorna True se o estado MUDOU de fato (site caiu ou voltou).
     """
     with _DB_LOCK:
         raw = _carregar_raw()
@@ -295,28 +308,48 @@ def registrar_disponibilidade(chat_id: int | str, online: bool) -> bool:
         user = UserData.from_dict(raw["users"][uid])
 
         estava_online = user.site_online
-        user.site_online = online
-
         mudou = False
 
-        if online and estava_online is False:
-            offline_desde = user.site_offline_desde
-            duracao = _calcular_duracao(offline_desde) if offline_desde else "?"
-            user.site_offline_desde = None
-            user.historico_disponibilidade.append(EventoDisponibilidade(
-                evento="voltou",
-                em=datetime.now().isoformat(),
-                ficou_offline_por=duracao,
-            ))
-            mudou = True
+        if online:
+            # Qualquer resposta OK reseta o contador de falhas
+            user.falhas_consecutivas = 0
 
-        elif not online and estava_online is not False:
-            user.site_offline_desde = datetime.now().isoformat()
-            user.historico_disponibilidade.append(EventoDisponibilidade(
-                evento="caiu",
-                em=datetime.now().isoformat(),
-            ))
-            mudou = True
+            if estava_online is False:
+                # Site estava marcado offline — registra retorno
+                offline_desde = user.site_offline_desde
+                duracao = _calcular_duracao(offline_desde) if offline_desde else "?"
+                user.site_offline_desde = None
+                user.site_online = True
+                user.historico_disponibilidade.append(EventoDisponibilidade(
+                    evento="voltou",
+                    em=datetime.now().isoformat(),
+                    ficou_offline_por=duracao,
+                ))
+                mudou = True
+            else:
+                user.site_online = True
+
+        else:
+            # Falha: incrementa contador mas só declara offline ao atingir o limiar
+            user.falhas_consecutivas += 1
+            logger.debug(
+                "Falha %d/%d para chat_id=%s",
+                user.falhas_consecutivas, LIMIAR_FALHAS, uid,
+            )
+
+            if user.falhas_consecutivas >= LIMIAR_FALHAS and estava_online is not False:
+                user.site_online = False
+                user.site_offline_desde = datetime.now().isoformat()
+                user.historico_disponibilidade.append(EventoDisponibilidade(
+                    evento="caiu",
+                    em=datetime.now().isoformat(),
+                ))
+                mudou = True
+                logger.info(
+                    "Site declarado offline após %d falhas consecutivas (chat_id=%s)",
+                    user.falhas_consecutivas, uid,
+                )
+            # else: falha transitória ainda dentro do limiar — ignora silenciosamente
 
         raw["users"][uid] = user.to_dict()
         _salvar_raw(raw)
