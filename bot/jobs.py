@@ -4,7 +4,8 @@ Jobs automáticos do bot: monitor de disponibilidade e busca periódica.
 
 job_monitor  — roda a cada N minutos, faz ping leve no site.
                Notifica quando o site cai ou volta.
-               Quando volta, dispara busca imediata.
+               Quando volta, só dispara busca imediata se o site esteve
+               offline por tempo suficiente para justificá-la (≥ MIN_OFFLINE_PARA_BUSCA_MIN).
 
 job_busca    — roda a cada N horas, faz varredura completa de editais.
                Ignorado silenciosamente se o site estiver offline.
@@ -13,6 +14,7 @@ job_busca    — roda a cada N horas, faz varredura completa de editais.
 from __future__ import annotations
 
 import logging
+import re
 
 from telegram.constants import ParseMode
 from telegram.ext import ContextTypes
@@ -22,6 +24,11 @@ from bot.formatters import esc, enviar_resultado_busca
 from bot.scraper import checar_site, buscar_novos_editais
 
 logger = logging.getLogger(__name__)
+
+# Tempo mínimo offline (em minutos) para justificar uma busca ao site voltar.
+# Se o site ficou fora por menos que isso, provavelmente foi um 503 transitório
+# e não há editais novos para encontrar.
+MIN_OFFLINE_PARA_BUSCA_MIN = 60
 
 
 # ─────────────────────────────────────────────
@@ -39,6 +46,22 @@ async def _send(context: ContextTypes.DEFAULT_TYPE, chat_id: int, text: str, **k
     await context.bot.send_message(chat_id=chat_id, text=text, **kwargs)
 
 
+def _duracao_em_minutos(duracao_str: str) -> int:
+    """
+    Converte a string de duração produzida por _calcular_duracao() para minutos.
+    Formatos suportados: "5min", "1h30min", "2d 3h15min".
+    Retorna 0 se não conseguir parsear.
+    """
+    total = 0
+    dias  = re.search(r"(\d+)d", duracao_str)
+    horas = re.search(r"(\d+)h", duracao_str)
+    mins  = re.search(r"(\d+)min", duracao_str)
+    if dias:  total += int(dias.group(1)) * 1440
+    if horas: total += int(horas.group(1)) * 60
+    if mins:  total += int(mins.group(1))
+    return total
+
+
 # ─────────────────────────────────────────────
 # Job — monitor de disponibilidade
 # ─────────────────────────────────────────────
@@ -47,7 +70,8 @@ async def _send(context: ContextTypes.DEFAULT_TYPE, chat_id: int, text: str, **k
 async def job_monitor(context: ContextTypes.DEFAULT_TYPE) -> None:
     """
     Ping leve no site. Notifica apenas quando o estado muda.
-    Se o site voltou, dispara busca imediata.
+    Se o site voltou após uma queda longa (≥ MIN_OFFLINE_PARA_BUSCA_MIN),
+    dispara busca imediata. Quedas curtas/transitórias apenas notificam.
     """
     chat_id  = context.job.chat_id
     settings = _settings_do_job(context)
@@ -65,38 +89,58 @@ async def job_monitor(context: ContextTypes.DEFAULT_TYPE) -> None:
 
 
 async def _notificar_voltou(context, chat_id: int, settings) -> None:
-    """Notifica que o site voltou e dispara busca imediata."""
+    """
+    Notifica que o site voltou.
+    Só dispara busca completa se o site esteve offline por tempo relevante
+    (≥ MIN_OFFLINE_PARA_BUSCA_MIN), evitando varreduras desnecessárias após
+    instabilidades passageiras de poucos minutos.
+    """
     user = get_user(chat_id, settings.config_padrao())
 
-    # Recupera duração do período offline do histórico
     offline_por = ""
+    deve_buscar = False
+
     if user.historico_disponibilidade:
         ultimo = user.historico_disponibilidade[-1]
         if ultimo.evento == "voltou" and ultimo.ficou_offline_por:
             offline_por = f"\nEstava offline há {esc(ultimo.ficou_offline_por)}\\."
+            minutos_offline = _duracao_em_minutos(ultimo.ficou_offline_por)
+            deve_buscar = minutos_offline >= MIN_OFFLINE_PARA_BUSCA_MIN
+            logger.info(
+                "Site voltou após %d min offline (chat_id=%s). Busca: %s",
+                minutos_offline, chat_id, "sim" if deve_buscar else "não",
+            )
 
-    logger.info("Site voltou. Disparando busca imediata para chat_id=%s", chat_id)
+    if deve_buscar:
+        await _send(
+            context,
+            chat_id,
+            f"🟢 *O site do SENAI\\-PE voltou\\!*"
+            f"{offline_por}\n\n"
+            f"🔍 Iniciando busca de editais automaticamente\\.\\.\\.",
+            parse_mode=ParseMode.MARKDOWN_V2,
+        )
 
-    await _send(
-        context,
-        chat_id,
-        f"🟢 *O site do SENAI\\-PE voltou\\!*"
-        f"{offline_por}\n\n"
-        f"🔍 Iniciando busca de editais automaticamente\\.\\.\\.",
-        parse_mode=ParseMode.MARKDOWN_V2,
-    )
+        resultado = await buscar_novos_editais(
+            chat_id=chat_id,
+            user=user,
+            url_editais=settings.url_editais,
+            timeout=settings.request_timeout,
+        )
 
-    resultado = await buscar_novos_editais(
-        chat_id=chat_id,
-        user=user,
-        url_editais=settings.url_editais,
-        timeout=settings.request_timeout,
-    )
+        async def send(txt, **kw):
+            await _send(context, chat_id, txt, **kw)
 
-    async def send(txt, **kw):
-        await _send(context, chat_id, txt, **kw)
+        await enviar_resultado_busca(send, resultado, "🟢")
 
-    await enviar_resultado_busca(send, resultado, "🟢")
+    else:
+        # Queda curta/transitória: só notifica o retorno, sem busca
+        await _send(
+            context,
+            chat_id,
+            f"🟢 *O site do SENAI\\-PE voltou\\!*{offline_por}",
+            parse_mode=ParseMode.MARKDOWN_V2,
+        )
 
 
 async def _notificar_caiu(context, chat_id: int, motivo: str) -> None:
