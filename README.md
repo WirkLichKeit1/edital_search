@@ -17,6 +17,7 @@
 - [Arquitetura](#arquitetura)
   - [Estrutura de diretórios](#estrutura-de-diretórios)
   - [Fluxo de busca](#fluxo-de-busca)
+  - [Fluxo do monitor de disponibilidade](#fluxo-do-monitor-de-disponibilidade)
   - [Modelo de dados](#modelo-de-dados)
 - [Testes](#testes)
 - [Deploy](#deploy)
@@ -27,7 +28,7 @@
 
 ## Visão geral
 
-O **Bot SENAI Editais** é um serviço de monitoramento que acompanha a página de editais do SENAI-PE e notifica automaticamente via Telegram quando surgem oportunidades relevantes para o usuário. A filtragem acontece em duas etapas: primeiro por cidade (no título do edital) e depois por termos de interesse (no título e, se necessário, no conteúdo completo do PDF).
+O **Bot SENAI Editais** é um serviço de monitoramento que acompanha a página de editais do SENAI-PE e notifica automaticamente via Telegram quando surgem oportunidades relevantes. A filtragem acontece em três etapas: primeiro por cidade (no título do edital **ou no contexto da página HTML**), depois por termos de interesse (título e contexto), e por último na análise do conteúdo completo do PDF quando o título for genérico.
 
 Cada usuário configura sua própria cidade e lista de termos de interesse. O bot persiste o histórico de editais aceitos e rejeitados por usuário, evitando notificações duplicadas.
 
@@ -38,15 +39,16 @@ Cada usuário configura sua própria cidade e lista de termos de interesse. O bo
 | Recurso | Detalhe |
 |---|---|
 | **Scraping de editais** | Coleta todos os links PDF da página de editais do SENAI-PE |
-| **Filtro por cidade** | Descarta editais cujo título não contenha a cidade configurada |
-| **Filtro por termos** | Busca termos de interesse no título e, se necessário, no texto completo do PDF |
-| **Análise de PDF** | Download e extração de texto de PDFs para editais com título genérico |
-| **Progresso em tempo real** | Atualizações ao vivo no Telegram durante a busca |
-| **Monitoramento de disponibilidade** | Detecta quando o site cai ou volta e notifica o usuário |
+| **Filtro por cidade** | Descarta editais cujo título **ou contexto da página** não contenha a cidade configurada |
+| **Filtro por termos** | Busca termos de interesse no título, contexto da página e, se necessário, no PDF |
+| **Análise de PDF** | Download e extração de texto de PDFs para editais com título genérico (limite de 10 MB) |
+| **Progresso em tempo real** | Atualizações ao vivo no Telegram durante a busca, com throttle anti-flood |
+| **Monitor com debounce** | Só declara o site offline após 3 falhas consecutivas — ignora 503 transitórios |
+| **Busca inteligente ao retorno** | Só dispara busca automática ao voltar se o site ficou offline ≥ 1 hora |
 | **Modo automático** | Job de monitor (ping periódico) + job de busca (varredura agendada) |
 | **Re-análise de rejeitados** | Reavalia editais rejeitados com a lista de termos atualizada |
 | **Configuração por usuário** | Cidade, termos e intervalos individuais por chat_id |
-| **Persistência JSON** | Banco de dados leve em `data/db.json`, sem dependências externas |
+| **Persistência JSON atômica** | Banco leve em `data/db.json` com escrita via arquivo temporário (evita corrupção) |
 | **Health check HTTP** | Servidor Flask integrado para plataformas de hospedagem |
 
 ---
@@ -102,7 +104,7 @@ Variáveis de ambiente / .env  (maior prioridade)
 
 ### Variáveis de ambiente
 
-Crie um arquivo `.env` na raiz do projeto com as seguintes variáveis:
+Crie um arquivo `.env` na raiz do projeto:
 
 | Variável | Obrigatória | Padrão | Descrição |
 |---|---|---|---|
@@ -114,7 +116,7 @@ Crie um arquivo `.env` na raiz do projeto com as seguintes variáveis:
 | `INTERVALO_BUSCA` | não | `86400` | Frequência da busca completa (segundos) |
 | `PORT` | não | `10000` | Porta do servidor Flask para health check |
 | `REQUEST_TIMEOUT` | não | `30` | Timeout máximo por requisição HTTP (segundos) |
-| `MAX_RETRIES` | não | `3` | Número de tentativas antes de desistir de um request |
+| `MAX_RETRIES` | não | `3` | Tentativas antes de desistir de um request |
 
 Exemplo de `.env` mínimo:
 
@@ -124,21 +126,17 @@ BOT_TOKEN=123456789:ABCdef...
 
 ### config.yaml
 
-Define os valores padrão aplicados a **novos usuários**. Usuários já cadastrados mantêm sua configuração individual, que pode ser alterada pelos comandos `/config`, `/addtermo` e `/rmtermo`.
+Define os valores padrão para **novos usuários**. Usuários já cadastrados mantêm sua configuração individual, alterável via `/config`, `/addtermo` e `/rmtermo`.
 
 ```yaml
-# Cidade filtrada nos títulos dos editais
 cidade_padrao: cabo
 
-# Intervalos de tempo (em segundos)
 intervalo_monitor: 300      # 5 min  — ping leve de disponibilidade
 intervalo_busca: 86400      # 24 h   — varredura completa de editais
 
-# URLs monitoradas
 url_editais: "https://www.pe.senai.br/editais/"
 url_portal:  "https://sge.pe.senai.br"
 
-# Termos usados para identificar editais de TI
 termos_padrao:
   - desenvolvimento de sistemas
   - informatica
@@ -150,7 +148,7 @@ termos_padrao:
   # adicione ou remova termos conforme necessário
 ```
 
-> **Nota:** a normalização de acentos é feita automaticamente. `"informática"` e `"informatica"` são equivalentes na comparação.
+> **Nota:** a normalização de acentos é automática. `"informática"` e `"informatica"` são equivalentes na comparação.
 
 ---
 
@@ -162,7 +160,7 @@ termos_padrao:
 |---|---|
 | `/buscar` | Executa uma busca completa agora, com log de progresso em tempo real |
 | `/listar` | Exibe os últimos editais aceitos (até 20) |
-| `/rejeitados` | Lista editais rejeitados agrupados por motivo de rejeição |
+| `/rejeitados` | Lista editais rejeitados agrupados por motivo |
 | `/forcar` | Re-analisa editais rejeitados por conteúdo usando os termos atuais |
 
 ### Monitoramento
@@ -177,10 +175,10 @@ termos_padrao:
 
 | Comando | Exemplo | Descrição |
 |---|---|---|
-| `/config` | `/config` | Exibe a configuração atual do usuário |
+| `/config` | `/config` | Exibe a configuração atual |
 | `/config cidade` | `/config cidade recife` | Altera a cidade do filtro |
-| `/addtermo` | `/addtermo machine learning` | Adiciona um termo à lista de interesse |
-| `/rmtermo` | `/rmtermo ads` | Remove um termo da lista |
+| `/addtermo` | `/addtermo machine learning` | Adiciona um termo de interesse |
+| `/rmtermo` | `/rmtermo ads` | Remove um termo |
 | `/termos` | `/termos` | Lista todos os termos ativos |
 | `/resetconfig` | `/resetconfig` | Restaura cidade e termos para os valores padrão |
 
@@ -231,7 +229,7 @@ senai-editais-bot/
 
 ### Fluxo de busca
 
-A cada `/buscar` ou disparo do `job_busca`, o seguinte pipeline é executado:
+A cada `/buscar` ou disparo do `job_busca`:
 
 ```
 pegar_editais(url)
@@ -241,10 +239,12 @@ pegar_editais(url)
             │       └── sim → pula (ja_conhecidos++)
             │
             ├── 1. Filtro de cidade
-            │       └── título não contém a cidade? → rejeita (motivo: cidade)
+            │       ├── título contém a cidade? → passa
+            │       ├── contexto da página contém a cidade? → passa
+            │       └── nenhum dos dois → rejeita (motivo: cidade)
             │
-            ├── 2. Filtro por título
-            │       └── algum termo encontrado no título? → aceita (encontrado_em: "titulo")
+            ├── 2. Filtro por termos (título + contexto da página)
+            │       └── algum termo encontrado? → aceita (encontrado_em: "titulo")
             │
             └── 3. Análise do PDF
                     ├── extrair_texto_pdf(link)
@@ -252,14 +252,31 @@ pegar_editais(url)
                     └── nenhum termo → rejeita (motivo: "sem termos de TI")
 ```
 
-O modo automático adiciona dois jobs independentes por usuário:
+### Fluxo do monitor de disponibilidade
 
-- **`job_monitor`** — ping leve a cada `intervalo_monitor` segundos. Notifica quando o estado muda (online ↔ offline). Ao detectar que o site voltou, dispara uma busca imediata.
-- **`job_busca`** — varredura completa a cada `intervalo_busca` segundos. Executa silenciosamente se o site estiver online; ignora e registra log se estiver offline (a recuperação é coberta pelo `job_monitor`).
+O `job_monitor` implementa um **debounce por contagem de falhas** para evitar falso-positivos causados por erros HTTP transitórios (503, timeouts pontuais):
+
+```
+check_site()
+    │
+    ├── online → reseta contador de falhas
+    │       └── estava offline? → notifica "voltou"
+    │               └── offline ≥ 1h? → dispara busca completa
+    │                                    senão → só notifica
+    │
+    └── offline → incrementa contador de falhas
+            └── contador ≥ 3 e estava online? → marca offline, notifica "caiu"
+                                senão → falha transitória, silêncio total
+```
+
+O modo automático mantém dois jobs independentes por usuário:
+
+- **`job_monitor`** — ping leve a cada `intervalo_monitor` segundos. Notifica quando o estado muda. Ao detectar retorno após queda longa (≥ 1 hora), dispara busca imediata.
+- **`job_busca`** — varredura completa a cada `intervalo_busca` segundos. Executa silenciosamente se o site estiver online; ignora se estiver offline (a recuperação é coberta pelo `job_monitor`).
 
 ### Modelo de dados
 
-O banco é um único arquivo `data/db.json` particionado por `chat_id`. Cada usuário tem a seguinte estrutura:
+O banco é um único arquivo `data/db.json` particionado por `chat_id`:
 
 ```
 UserData
@@ -274,8 +291,9 @@ UserData
 │   ├── total_buscas: int
 │   └── total_pdfs_baixados: int
 ├── site_online: bool | None
-├── site_offline_desde: str | None      # ISO datetime
-├── ultima_busca_completa: str | None   # ISO datetime
+├── site_offline_desde: str | None          # ISO datetime
+├── ultima_busca_completa: str | None       # ISO datetime
+├── falhas_consecutivas: int                # contador de debounce
 └── historico_disponibilidade: list[EventoDisponibilidade]
 ```
 
@@ -283,17 +301,17 @@ UserData
 Edital
 ├── titulo: str
 ├── link: str
-├── aceito_em / rejeitado_em: str       # ISO datetime
-├── encontrado_em: str                  # "titulo" | "pdf" | "reanalise_titulo"
-├── termos_ti: list[str]                # termos que levaram à aceitação
-└── motivo: str | None                  # motivo de rejeição
+├── aceito_em / rejeitado_em: str           # ISO datetime
+├── encontrado_em: str                      # "titulo" | "pdf" | "reanalise_titulo"
+├── termos_ti: list[str]                    # termos que levaram à aceitação
+└── motivo: str | None                      # motivo de rejeição
 ```
 
 ---
 
 ## Testes
 
-A suíte cobre as três camadas principais do projeto sem depender de rede ou de um bot Telegram real.
+A suíte cobre as três camadas principais sem depender de rede ou de um bot Telegram real.
 
 ```bash
 # Rodar todos os testes
@@ -352,8 +370,6 @@ Exemplo de resposta do `/health`:
 ---
 
 ## Contribuindo
-
-Contribuições são bem-vindas. Siga o fluxo padrão:
 
 1. Fork do repositório
 2. Crie uma branch descritiva: `git checkout -b feat/nova-funcionalidade`
