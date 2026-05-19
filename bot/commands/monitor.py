@@ -9,7 +9,7 @@ from telegram import Update
 from telegram.constants import ParseMode
 from telegram.ext import ContextTypes
 
-from bot.database import get_user, registrar_disponibilidade, tempo_offline
+from bot.database import get_user, registrar_disponibilidade, tempo_offline, set_auto_ativo
 from bot.formatters import esc
 from bot.scraper import checar_site
 from config import Settings
@@ -27,16 +27,29 @@ def setup(settings: Settings):
         online_portal, status_portal = await checar_site(settings.url_portal)
         mudou = registrar_disponibilidade(chat_id, online_site)
 
+        # Recarrega para refletir o estado atualizado pelo registrar_disponibilidade
+        user = get_user(chat_id, settings.config_padrao())
+
         offline_info = ""
         if not online_site and user.site_offline_desde:
             offline_info = f"\n⏱ Offline há: `{esc(tempo_offline(user))}`"
 
+        # Distingue o status instantâneo (status_site) do estado consolidado do banco.
+        # O bot só declara o site offline após LIMIAR_FALHAS falhas consecutivas,
+        # então um único erro 5xx pode aparecer em status_site mas o banco ainda
+        # registrar o site como online — informamos ambos para não confundir o usuário.
+        estado_banco = "Online ✅" if user.site_online else (
+            "Offline ❌" if user.site_online is False else "Desconhecido ❓"
+        )
+
         texto = (
             f"🌐 *Status dos sistemas SENAI\\-PE*\n\n"
-            f"📋 Site de editais: {esc(status_site)}\n"
+            f"📋 Editais \\(agora\\): {esc(status_site)}\n"
+            f"📋 Editais \\(estado consolidado\\): {esc(estado_banco)}\n"
             f"🎓 Portal do aluno: {esc(status_portal)}"
             f"{offline_info}\n\n"
-            f"🕒 Verificado agora\\."
+            f"🕒 Verificado agora\\.\n"
+            f"_O estado consolidado muda após {settings.limiar_falhas} falhas seguidas\\._"
         )
 
         if mudou and online_site:
@@ -84,6 +97,9 @@ def setup(settings: Settings):
             data={"settings": settings},
         )
 
+        # Persiste o estado para sobreviver a restarts do bot
+        set_auto_ativo(chat_id, True)
+
         monitor_min = intervalo_monitor // 60
         busca_h     = intervalo_busca // 3600
 
@@ -113,6 +129,9 @@ def setup(settings: Settings):
                 parse_mode=ParseMode.MARKDOWN_V2,
             )
             return
+
+        # Persiste a desativação
+        set_auto_ativo(chat_id, False)
 
         await update.message.reply_text(
             "🛑 *Modo automático desativado\\.*\nUse /auto para reativar\\.",
