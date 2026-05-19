@@ -17,7 +17,7 @@ import threading
 from telegram import BotCommand, Update
 from telegram.ext import Application, CommandHandler
 
-from bot_config import carregar_settings
+from config import carregar_settings
 from server import iniciar as iniciar_flask
 
 import bot.commands.info    as mod_info
