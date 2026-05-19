@@ -5,6 +5,7 @@ Responsabilidades:
   - Carregar Settings
   - Iniciar Flask em thread daemon
   - Registrar todos os handlers e comandos do Telegram
+  - Restaurar jobs automáticos de usuários que tinham /auto ativo antes do restart
   - Iniciar o bot em modo polling
 """
 
@@ -40,22 +41,18 @@ logger = logging.getLogger(__name__)
 # ─────────────────────────────────────────────
 
 _COMANDOS = [
-    # Busca
     BotCommand("buscar",      "Buscar novos editais agora"),
     BotCommand("listar",      "Listar editais aceitos"),
     BotCommand("rejeitados",  "Ver editais rejeitados e motivos"),
     BotCommand("forcar",      "Re-analisar editais rejeitados"),
-    # Monitoramento
     BotCommand("checar",      "Verificar se o site está online"),
     BotCommand("auto",        "Ativar modo automático (monitor + busca)"),
     BotCommand("parar",       "Desativar modo automático"),
-    # Configuração
     BotCommand("config",      "Ver ou alterar sua configuração"),
     BotCommand("addtermo",    "Adicionar um termo de busca"),
     BotCommand("rmtermo",     "Remover um termo de busca"),
     BotCommand("termos",      "Listar seus termos ativos"),
     BotCommand("resetconfig", "Restaurar configuração padrão"),
-    # Info
     BotCommand("status",      "Painel completo de informações"),
     BotCommand("ajuda",       "Exibir ajuda"),
 ]
@@ -66,25 +63,17 @@ _COMANDOS = [
 # ─────────────────────────────────────────────
 
 def _registrar_handlers(app: Application, settings) -> None:
-    """
-    Cada módulo de commands expõe setup(settings) → [handler, ...].
-    Aqui mapeamos cada função ao seu comando pelo nome.
-    """
     mapeamento = {
-        # info
         "cmd_start":       "start",
         "cmd_ajuda":       "ajuda",
         "cmd_status":      "status",
-        # monitor
         "cmd_checar":      "checar",
         "cmd_auto":        "auto",
         "cmd_parar":       "parar",
-        # busca
         "cmd_buscar":      "buscar",
         "cmd_listar":      "listar",
         "cmd_rejeitados":  "rejeitados",
         "cmd_forcar":      "forcar",
-        # config
         "cmd_config":      "config",
         "cmd_addtermo":    "addtermo",
         "cmd_rmtermo":     "rmtermo",
@@ -106,13 +95,54 @@ def _registrar_handlers(app: Application, settings) -> None:
 
 
 # ─────────────────────────────────────────────
+# Restauração de jobs após restart
+# ─────────────────────────────────────────────
+
+def _restaurar_jobs(app: Application, settings) -> None:
+    """
+    Recria os jobs automáticos para usuários que tinham auto_ativo=True
+    antes do processo reiniciar. Chamado dentro do post_init, após o
+    event loop estar disponível.
+    """
+    from bot.database import listar_users_auto_ativo, get_user
+    from bot.jobs import job_monitor, job_busca
+
+    chat_ids = listar_users_auto_ativo()
+    if not chat_ids:
+        return
+
+    logger.info("Restaurando modo automático para %d usuário(s)...", len(chat_ids))
+
+    for uid in chat_ids:
+        chat_id = int(uid)
+        user = get_user(chat_id, settings.config_padrao())
+
+        app.job_queue.run_repeating(
+            job_monitor,
+            interval=user.config.intervalo_monitor,
+            first=60,   # pequeno delay inicial para o bot estabilizar
+            chat_id=chat_id,
+            name=f"monitor_{chat_id}",
+            data={"settings": settings},
+        )
+        app.job_queue.run_repeating(
+            job_busca,
+            interval=user.config.intervalo_busca,
+            first=120,
+            chat_id=chat_id,
+            name=f"busca_{chat_id}",
+            data={"settings": settings},
+        )
+        logger.info("  Jobs restaurados para chat_id=%s", uid)
+
+
+# ─────────────────────────────────────────────
 # Ponto de entrada
 # ─────────────────────────────────────────────
 
 def main() -> None:
     settings = carregar_settings()
 
-    # Flask em background
     threading.Thread(
         target=iniciar_flask,
         args=(settings.porta_flask,),
@@ -126,10 +156,10 @@ def main() -> None:
 
     _registrar_handlers(app, settings)
 
-    # Registra o menu de comandos no Telegram assim que o bot conectar
     async def post_init(a: Application) -> None:
         await a.bot.set_my_commands(_COMANDOS)
         logger.info("%d comando(s) registrado(s) no Telegram.", len(_COMANDOS))
+        _restaurar_jobs(a, settings)
 
     app.post_init = post_init
 
