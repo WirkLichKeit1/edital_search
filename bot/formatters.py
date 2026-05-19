@@ -76,6 +76,12 @@ def formatar_status(user: UserData, auto_ativo: bool) -> str:
 
     auto_str = "Ativo ✅" if auto_ativo else "Inativo ⏸"
 
+    if user.config.horario_busca:
+        busca_str = f"Diariamente às `{esc(user.config.horario_busca)}`"
+    else:
+        busca_h = user.config.intervalo_busca // 3600
+        busca_str = f"A cada `{busca_h}h` \\(intervalo\\)"
+
     hist_str = ""
     for ev in reversed(user.historico_disponibilidade[-3:]):
         em = ev.em[:16].replace("T", " ")
@@ -97,6 +103,7 @@ def formatar_status(user: UserData, auto_ativo: bool) -> str:
         f"🔍 Total de buscas: `{user.stats.total_buscas}`\n"
         f"📥 PDFs analisados: `{user.stats.total_pdfs_baixados}`\n"
         f"🕒 Última busca: `{esc(ultima)}`\n"
+        f"🕐 Frequência de busca: {busca_str}\n"
         f"📍 Cidade: `{esc(user.config.cidade)}`\n"
         f"🏷 Termos ativos: `{len(user.config.termos)}`"
     )
@@ -111,13 +118,18 @@ def formatar_config(user: UserData) -> str:
     """Formata a config atual do usuário para exibição."""
     termos_str = "\n".join(f"  • {esc(t)}" for t in user.config.termos) or "  _nenhum_"
     monitor_min = user.config.intervalo_monitor // 60
-    busca_h = user.config.intervalo_busca // 3600
+
+    if user.config.horario_busca:
+        busca_str = f"todos os dias às `{esc(user.config.horario_busca)}`"
+    else:
+        busca_h = user.config.intervalo_busca // 3600
+        busca_str = f"a cada `{busca_h}` h \\(intervalo\\)"
 
     return (
         f"⚙️ *Sua configuração atual*\n\n"
         f"📍 Cidade: `{esc(user.config.cidade)}`\n"
         f"👁 Monitor: a cada `{monitor_min}` min\n"
-        f"🔍 Busca: a cada `{busca_h}` h\n\n"
+        f"🔍 Busca: {busca_str}\n\n"
         f"🏷 *Termos \\({len(user.config.termos)}\\):*\n{termos_str}"
     )
 
