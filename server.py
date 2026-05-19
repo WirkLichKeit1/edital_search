@@ -11,7 +11,7 @@ import logging
 
 from flask import Flask, jsonify
 
-from bot.database import _carregar_raw
+from bot.database import get_stats
 
 logger = logging.getLogger(__name__)
 
@@ -27,22 +27,8 @@ def home():
 def health():
     """Retorna métricas agregadas de todos os usuários."""
     try:
-        raw = _carregar_raw()
-        users = raw.get("users", {})
-
-        total_aceitos    = sum(len(u.get("aceitos", []))    for u in users.values())
-        total_rejeitados = sum(len(u.get("rejeitados", [])) for u in users.values())
-        total_buscas     = sum(u.get("stats", {}).get("total_buscas", 0) for u in users.values())
-        total_pdfs       = sum(u.get("stats", {}).get("total_pdfs_baixados", 0) for u in users.values())
-
-        return jsonify({
-            "status":           "ok",
-            "total_usuarios":   len(users),
-            "total_aceitos":    total_aceitos,
-            "total_rejeitados": total_rejeitados,
-            "total_buscas":     total_buscas,
-            "total_pdfs":       total_pdfs,
-        })
+        stats = get_stats()
+        return jsonify({"status": "ok", **stats})
     except Exception as exc:
         logger.error("Erro no health check: %s", exc)
         return jsonify({"status": "error", "detail": str(exc)}), 500
