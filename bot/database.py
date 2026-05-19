@@ -79,6 +79,10 @@ class UserConfig:
     termos: list[str] = field(default_factory=list)
     intervalo_monitor: int = 300      # segundos
     intervalo_busca: int = 86_400     # segundos
+    # Horário fixo diário para a busca automática, formato "HH:MM" (fuso local do servidor).
+    # None = usar intervalo_busca com run_repeating (comportamento anterior).
+    # Definido via /horario HH:MM; removido via /horario off.
+    horario_busca: Optional[str] = None
 
     def to_dict(self) -> dict:
         return asdict(self)
@@ -90,6 +94,7 @@ class UserConfig:
             termos=d.get("termos", []),
             intervalo_monitor=d.get("intervalo_monitor", 300),
             intervalo_busca=d.get("intervalo_busca", 86_400),
+            horario_busca=d.get("horario_busca"),
         )
 
 
