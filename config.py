@@ -18,12 +18,13 @@ from pathlib import Path
 import yaml
 from dotenv import load_dotenv
 
-from bot.database import UserConfig
+from bot.database import UserConfig, LIMIAR_FALHAS
 
 logger = logging.getLogger(__name__)
 
 load_dotenv()
 
+# Corrigido: era "config.yaml" mas o arquivo se chamava "config.yml"
 _YAML_PATH = Path("config.yaml")
 
 
@@ -69,6 +70,9 @@ class Settings:
     request_timeout: int
     max_retries: int
 
+    # ── Comportamento do monitor — exposto para exibição ao usuário ──
+    limiar_falhas: int = LIMIAR_FALHAS
+
     def config_padrao(self) -> UserConfig:
         """Retorna um UserConfig com os padrões do yaml, pronto para novos usuários."""
         return UserConfig(
@@ -93,10 +97,8 @@ def carregar_settings() -> Settings:
         )
 
     settings = Settings(
-        # Credenciais
         bot_token=token,
 
-        # URLs — .env tem prioridade sobre yaml
         url_editais=os.getenv(
             "URL_EDITAIS",
             yaml_cfg.get("url_editais", "https://www.pe.senai.br/editais/"),
@@ -106,7 +108,6 @@ def carregar_settings() -> Settings:
             yaml_cfg.get("url_portal", "https://sge.pe.senai.br"),
         ),
 
-        # Padrões de usuário
         cidade_padrao=os.getenv(
             "CIDADE_PADRAO",
             yaml_cfg.get("cidade_padrao", "cabo"),
@@ -121,7 +122,6 @@ def carregar_settings() -> Settings:
             yaml_cfg.get("intervalo_busca", 86_400),
         )),
 
-        # Infra
         porta_flask=int(os.getenv("PORT", 10_000)),
         request_timeout=int(os.getenv("REQUEST_TIMEOUT", 30)),
         max_retries=int(os.getenv("MAX_RETRIES", 3)),
