@@ -34,10 +34,6 @@ def setup(settings: Settings):
         if not online_site and user.site_offline_desde:
             offline_info = f"\n⏱ Offline há: `{esc(tempo_offline(user))}`"
 
-        # Distingue o status instantâneo (status_site) do estado consolidado do banco.
-        # O bot só declara o site offline após LIMIAR_FALHAS falhas consecutivas,
-        # então um único erro 5xx pode aparecer em status_site mas o banco ainda
-        # registrar o site como online — informamos ambos para não confundir o usuário.
         estado_banco = "Online ✅" if user.site_online else (
             "Offline ❌" if user.site_online is False else "Desconhecido ❓"
         )
@@ -58,10 +54,9 @@ def setup(settings: Settings):
         await msg.edit_text(texto, parse_mode=ParseMode.MARKDOWN_V2)
 
     async def cmd_auto(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-        from bot.jobs import job_monitor, job_busca
+        from bot.scheduler import agendar_jobs
 
         chat_id = update.effective_chat.id
-        user    = get_user(chat_id, settings.config_padrao())
 
         ja_ativo = bool(
             context.job_queue.get_jobs_by_name(f"monitor_{chat_id}") or
@@ -76,41 +71,31 @@ def setup(settings: Settings):
             )
             return
 
-        intervalo_monitor = user.config.intervalo_monitor
-        intervalo_busca   = user.config.intervalo_busca
-
-        context.job_queue.run_repeating(
-            job_monitor,
-            interval=intervalo_monitor,
-            first=15,
-            chat_id=chat_id,
-            name=f"monitor_{chat_id}",
-            data={"settings": settings},
-        )
-
-        context.job_queue.run_repeating(
-            job_busca,
-            interval=intervalo_busca,
-            first=30,
-            chat_id=chat_id,
-            name=f"busca_{chat_id}",
-            data={"settings": settings},
-        )
-
-        # Persiste o estado para sobreviver a restarts do bot
+        info = agendar_jobs(context.application, chat_id, settings)
         set_auto_ativo(chat_id, True)
 
-        monitor_min = intervalo_monitor // 60
-        busca_h     = intervalo_busca // 3600
+        monitor_min = info["intervalo_monitor_min"]
+
+        if info["modo_busca"] == "horario":
+            busca_linha = (
+                f"🔍 *Busca* — todos os dias às `{esc(info['horario'])}`\n"
+                f"  → Só executa se o site estiver online"
+            )
+        else:
+            busca_h = info["intervalo_h"]
+            busca_linha = (
+                f"🔍 *Busca* — varredura completa a cada `{busca_h}` h\n"
+                f"  → Só executa se o site estiver online"
+            )
 
         await update.message.reply_text(
             "⚙️ *Modo automático ativado\\!*\n\n"
             f"👁 *Monitor* — verifica o site a cada `{monitor_min}` min\n"
             "  → Notifica quando o site *cair* ou *voltar*\n"
             "  → Quando voltar, já dispara uma busca imediatamente\n\n"
-            f"🔍 *Busca* — varredura completa a cada `{busca_h}` h\n"
-            "  → Só executa se o site estiver online\n\n"
-            "Use /parar para desativar\\.",
+            f"{busca_linha}\n\n"
+            "Use /parar para desativar\\.\n"
+            "Use /horario para configurar um horário fixo de busca\\.",
             parse_mode=ParseMode.MARKDOWN_V2,
         )
 
@@ -130,7 +115,6 @@ def setup(settings: Settings):
             )
             return
 
-        # Persiste a desativação
         set_auto_ativo(chat_id, False)
 
         await update.message.reply_text(
