@@ -7,7 +7,6 @@ Nenhuma lógica de negócio aqui — só apresentação.
 from __future__ import annotations
 
 import time
-import asyncio
 import logging
 from typing import Callable, Awaitable
 
@@ -15,7 +14,8 @@ from telegram import Message
 from telegram.constants import ParseMode
 
 from bot.database import Edital, UserData
-from bot.database import tempo_offline as _tempo_offline  # re-exportado por conveniência
+from bot.database import tempo_offline as _tempo_offline
+from bot.scraper import BADGE_MAP
 
 logger = logging.getLogger(__name__)
 
@@ -31,10 +31,7 @@ _MD_RESERVED = r"\_*[]()~`>#+-=|{}.!"
 def esc(texto: str | None) -> str:
     """
     Escapa todos os caracteres reservados do MarkdownV2.
-
-    FIX: aceita None explicitamente — vários campos opcionais do Edital
-    (motivo, encontrado_em) podem ser None e eram passados diretamente
-    ao esc(), causando AttributeError em runtime.
+    Aceita None explicitamente — campos opcionais do Edital podem ser None.
     """
     if texto is None:
         return ""
@@ -48,16 +45,9 @@ def esc(texto: str | None) -> str:
 # ─────────────────────────────────────────────
 
 
-_BADGE_MAP = {
-    "titulo":           "📌 título",
-    "pdf":              "📄 PDF",
-    "reanalise_titulo": "🔄 reanálise",
-}
-
-
 def formatar_edital(edital: Edital) -> str:
     """Formata um edital aceito para exibição no Telegram (MarkdownV2)."""
-    badge     = _BADGE_MAP.get(edital.encontrado_em or "", edital.encontrado_em or "?")
+    badge     = BADGE_MAP.get(edital.encontrado_em or "", edital.encontrado_em or "?")
     termos    = edital.termos_ti or []
     termos_str = ", ".join(termos[:3]) if termos else "—"
 
@@ -73,7 +63,6 @@ def formatar_edital(edital: Edital) -> str:
 def formatar_status(user: UserData, auto_ativo: bool) -> str:
     """Formata o painel /status completo para um usuário."""
 
-    # Site
     if user.site_online is True:
         site_str = "Online ✅"
     elif user.site_online is False:
@@ -81,15 +70,12 @@ def formatar_status(user: UserData, auto_ativo: bool) -> str:
     else:
         site_str = "Desconhecido ❓"
 
-    # Última busca
     ultima = user.ultima_busca_completa or "nunca"
     if ultima != "nunca":
         ultima = ultima[:16].replace("T", " ")
 
-    # Modo automático
     auto_str = "Ativo ✅" if auto_ativo else "Inativo ⏸"
 
-    # Histórico de disponibilidade
     hist_str = ""
     for ev in reversed(user.historico_disponibilidade[-3:]):
         em = ev.em[:16].replace("T", " ")
@@ -140,8 +126,6 @@ def formatar_config(user: UserData) -> str:
 # Helpers de envio
 # ─────────────────────────────────────────────
 
-
-# Tipo de função de envio compatível com reply_text e bot.send_message
 SendFn = Callable[..., Awaitable[Message]]
 
 
