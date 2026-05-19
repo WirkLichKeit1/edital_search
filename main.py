@@ -48,6 +48,7 @@ _COMANDOS = [
     BotCommand("checar",      "Verificar se o site está online"),
     BotCommand("auto",        "Ativar modo automático (monitor + busca)"),
     BotCommand("parar",       "Desativar modo automático"),
+    BotCommand("horario",     "Definir horário fixo diário para a busca"),
     BotCommand("config",      "Ver ou alterar sua configuração"),
     BotCommand("addtermo",    "Adicionar um termo de busca"),
     BotCommand("rmtermo",     "Remover um termo de busca"),
@@ -79,6 +80,7 @@ def _registrar_handlers(app: Application, settings) -> None:
         "cmd_rmtermo":     "rmtermo",
         "cmd_termos":      "termos",
         "cmd_resetconfig": "resetconfig",
+        "cmd_horario":     "horario",
     }
 
     modulos = [mod_info, mod_monitor, mod_busca, mod_config]
@@ -101,11 +103,11 @@ def _registrar_handlers(app: Application, settings) -> None:
 def _restaurar_jobs(app: Application, settings) -> None:
     """
     Recria os jobs automáticos para usuários que tinham auto_ativo=True
-    antes do processo reiniciar. Chamado dentro do post_init, após o
-    event loop estar disponível.
+    antes do processo reiniciar. Usa agendar_jobs() para respeitar
+    horario_busca de cada usuário automaticamente.
     """
-    from bot.database import listar_users_auto_ativo, get_user
-    from bot.jobs import job_monitor, job_busca
+    from bot.database import listar_users_auto_ativo
+    from bot.scheduler import agendar_jobs
 
     chat_ids = listar_users_auto_ativo()
     if not chat_ids:
@@ -115,25 +117,18 @@ def _restaurar_jobs(app: Application, settings) -> None:
 
     for uid in chat_ids:
         chat_id = int(uid)
-        user = get_user(chat_id, settings.config_padrao())
-
-        app.job_queue.run_repeating(
-            job_monitor,
-            interval=user.config.intervalo_monitor,
-            first=60,   # pequeno delay inicial para o bot estabilizar
-            chat_id=chat_id,
-            name=f"monitor_{chat_id}",
-            data={"settings": settings},
+        info = agendar_jobs(
+            app,
+            chat_id,
+            settings,
+            first_monitor=60,   # pequeno delay inicial para o bot estabilizar
+            first_busca=120,
         )
-        app.job_queue.run_repeating(
-            job_busca,
-            interval=user.config.intervalo_busca,
-            first=120,
-            chat_id=chat_id,
-            name=f"busca_{chat_id}",
-            data={"settings": settings},
+        logger.info(
+            "  Jobs restaurados para chat_id=%s (busca: %s)",
+            uid,
+            info["horario"] or f"intervalo {info['intervalo_h']}h",
         )
-        logger.info("  Jobs restaurados para chat_id=%s", uid)
 
 
 # ─────────────────────────────────────────────
