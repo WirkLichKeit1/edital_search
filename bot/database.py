@@ -18,8 +18,13 @@ logger = logging.getLogger(__name__)
 
 ARQUIVO_DB = Path("data/db.json")
 
-# FIX: lock global para evitar corrida entre job_monitor e job_busca
-# (ambos podem chamar salvar_user/registrar_disponibilidade simultaneamente)
+# Lock global para serializar acessos ao arquivo JSON entre:
+#   - o thread principal do asyncio (handlers e jobs do bot)
+#   - o thread daemon do Flask (endpoint /health)
+# Dentro do event loop do asyncio as coroutines já são cooperativas
+# (nunca rodam em paralelo), portanto o lock protege apenas a fronteira
+# asyncio ↔ Flask. Se futuramente o banco for migrado para SQLite ou
+# similar, este lock pode ser removido.
 _DB_LOCK = threading.Lock()
 
 # Número de checks falhos consecutivos necessários para declarar o site offline.
@@ -38,12 +43,19 @@ class Edital:
     link: str
     aceito_em: Optional[str] = None
     rejeitado_em: Optional[str] = None
-    encontrado_em: Optional[str] = None   # "titulo" | "pdf" | "reanalise_titulo"
+    # "titulo" | "contexto_pagina" | "pdf" | "reanalise_titulo"
+    encontrado_em: Optional[str] = None
     termos_ti: list[str] = field(default_factory=list)
     motivo: Optional[str] = None          # motivo de rejeição
+    # Texto ao redor do link na página — nunca persistido no banco,
+    # preenchido apenas durante uma sessão de scraping.
+    texto_contexto: str = field(default="", repr=False)
 
     def to_dict(self) -> dict:
-        return {k: v for k, v in asdict(self).items() if v is not None}
+        d = {k: v for k, v in asdict(self).items() if v is not None}
+        # texto_contexto é transitório: não salvar no banco
+        d.pop("texto_contexto", None)
+        return d
 
     @staticmethod
     def from_dict(d: dict) -> "Edital":
@@ -55,6 +67,8 @@ class Edital:
             encontrado_em=d.get("encontrado_em"),
             termos_ti=d.get("termos_ti", []),
             motivo=d.get("motivo"),
+            # texto_contexto nunca vem do banco; começa vazio
+            texto_contexto="",
         )
 
 
@@ -124,7 +138,10 @@ class UserData:
     site_offline_desde: Optional[str] = None
     ultima_busca_completa: Optional[str] = None
     historico_disponibilidade: list[EventoDisponibilidade] = field(default_factory=list)
-    falhas_consecutivas: int = 0  # checks falhos seguidos; só declara offline ao atingir LIMIAR_FALHAS
+    falhas_consecutivas: int = 0
+    # Indica se o usuário ativou o modo automático (/auto).
+    # Persiste entre restarts do bot.
+    auto_ativo: bool = False
 
     def links_conhecidos(self) -> set[str]:
         return {e.link for e in self.aceitos + self.rejeitados}
@@ -140,6 +157,7 @@ class UserData:
             "ultima_busca_completa": self.ultima_busca_completa,
             "historico_disponibilidade": [ev.to_dict() for ev in self.historico_disponibilidade],
             "falhas_consecutivas": self.falhas_consecutivas,
+            "auto_ativo": self.auto_ativo,
         }
 
     @staticmethod
@@ -157,6 +175,7 @@ class UserData:
                 for ev in d.get("historico_disponibilidade", [])
             ],
             falhas_consecutivas=d.get("falhas_consecutivas", 0),
+            auto_ativo=d.get("auto_ativo", False),
         )
 
 
@@ -178,7 +197,7 @@ def _carregar_raw() -> dict:
 
 def _salvar_raw(raw: dict) -> None:
     ARQUIVO_DB.parent.mkdir(parents=True, exist_ok=True)
-    # FIX: escrita atômica via arquivo temporário — evita DB corrompido
+    # Escrita atômica via arquivo temporário — evita DB corrompido
     # se o processo for morto no meio de uma escrita.
     tmp = ARQUIVO_DB.with_suffix(".tmp")
     tmp.write_text(json.dumps(raw, indent=2, ensure_ascii=False), encoding="utf-8")
@@ -212,6 +231,35 @@ def salvar_user(chat_id: int | str, user: UserData) -> None:
         _salvar_raw(raw)
 
 
+def salvar_resultado_busca(
+    chat_id: int | str,
+    user: UserData,
+) -> None:
+    """
+    Persiste apenas os campos produzidos por uma busca:
+      aceitos, rejeitados, stats, ultima_busca_completa.
+
+    Campos de disponibilidade (site_online, site_offline_desde,
+    falhas_consecutivas, historico_disponibilidade) são relidos do banco
+    antes de salvar, evitando que uma busca longa sobrescreva um estado
+    de disponibilidade gravado pelo job_monitor durante a execução.
+    """
+    with _DB_LOCK:
+        raw = _carregar_raw()
+        uid = str(chat_id)
+
+        # Parte estável: o que a busca produziu
+        atual = raw["users"][uid]
+        atual["aceitos"]               = [e.to_dict() for e in user.aceitos]
+        atual["rejeitados"]            = [e.to_dict() for e in user.rejeitados]
+        atual["stats"]                 = user.stats.to_dict()
+        atual["ultima_busca_completa"] = user.ultima_busca_completa
+        # config não é modificada durante uma busca; preserva o que está no banco
+
+        raw["users"][uid] = atual
+        _salvar_raw(raw)
+
+
 def atualizar_config(chat_id: int | str, **kwargs) -> UserData:
     """
     Atualiza campos da UserConfig de um usuário e persiste.
@@ -231,6 +279,25 @@ def atualizar_config(chat_id: int | str, **kwargs) -> UserData:
         raw["users"][uid] = user.to_dict()
         _salvar_raw(raw)
         return user
+
+
+def set_auto_ativo(chat_id: int | str, ativo: bool) -> None:
+    """Persiste o estado do modo automático para sobreviver a restarts."""
+    with _DB_LOCK:
+        raw = _carregar_raw()
+        uid = str(chat_id)
+        raw["users"][uid]["auto_ativo"] = ativo
+        _salvar_raw(raw)
+
+
+def listar_users_auto_ativo() -> list[str]:
+    """Retorna lista de chat_ids cujo auto_ativo está True. Usado no post_init."""
+    with _DB_LOCK:
+        raw = _carregar_raw()
+        return [
+            uid for uid, data in raw.get("users", {}).items()
+            if data.get("auto_ativo", False)
+        ]
 
 
 # ─────────────────────────────────────────────
@@ -354,3 +421,26 @@ def registrar_disponibilidade(chat_id: int | str, online: bool) -> bool:
         raw["users"][uid] = user.to_dict()
         _salvar_raw(raw)
         return mudou
+
+
+# ─────────────────────────────────────────────
+# Métricas públicas (para o servidor Flask)
+# ─────────────────────────────────────────────
+
+
+def get_stats() -> dict:
+    """
+    Retorna métricas agregadas de todos os usuários.
+    API pública para o servidor Flask — não expõe estruturas internas.
+    """
+    with _DB_LOCK:
+        raw = _carregar_raw()
+        users = raw.get("users", {})
+
+        return {
+            "total_usuarios":   len(users),
+            "total_aceitos":    sum(len(u.get("aceitos", []))    for u in users.values()),
+            "total_rejeitados": sum(len(u.get("rejeitados", [])) for u in users.values()),
+            "total_buscas":     sum(u.get("stats", {}).get("total_buscas", 0)          for u in users.values()),
+            "total_pdfs":       sum(u.get("stats", {}).get("total_pdfs_baixados", 0)   for u in users.values()),
+        }
