@@ -195,8 +195,16 @@ async def pegar_editais(url_editais: str, timeout: int = 30) -> list[Edital]:
         if ".pdf" not in href.lower():
             continue
 
-        # Verifica palavras-chave no texto do próprio <a>
-        if not _link_eh_candidato(titulo):
+        # Captura texto ao redor do link cedo: além de ajudar a montar o título,
+        # também é necessário para a verificação de candidatura logo abaixo.
+        contexto = _extrair_contexto_link(link)
+
+        # Verifica palavras-chave no texto do próprio <a> OU no contexto ao redor.
+        # Só checar o texto do <a> deixava passar batido casos como
+        # <a href="x.pdf">Download PDF</a> com "Edital 010 - Cabo Informática"
+        # na célula vizinha: o link nunca chegava a ser considerado candidato,
+        # e a lógica de fallback pro contexto (logo abaixo) nunca era alcançada.
+        if not _link_eh_candidato(titulo) and not _link_eh_candidato(contexto):
             continue
 
         # Resolve URL relativa corretamente
@@ -207,9 +215,6 @@ async def pegar_editais(url_editais: str, timeout: int = 30) -> list[Edital]:
         if href in links_vistos:
             continue
         links_vistos.add(href)
-
-        # Captura texto ao redor do link na página para auxiliar filtragem
-        contexto = _extrair_contexto_link(link)
 
         # Prefere o título do <a> quando descritivo; usa contexto como fallback
         titulo_lower = titulo.strip().lower()

@@ -16,6 +16,7 @@ from bot.database import (
     UserStats,
     UserData,
     EventoDisponibilidade,
+    LIMIAR_FALHAS,
     get_user,
     salvar_user,
     atualizar_config,
@@ -223,10 +224,28 @@ class TestDisponibilidade:
         assert user.site_online is True
         assert user.site_offline_desde is None
 
-    def test_muda_de_online_para_offline(self, config_padrao):
+    def test_falhas_abaixo_do_limiar_nao_mudam_estado(self, config_padrao):
+        """Debounce: falhas consecutivas abaixo de LIMIAR_FALHAS não derrubam o site."""
         user = get_user(123, config_padrao)
         user.site_online = True
         salvar_user(123, user)
+
+        for _ in range(LIMIAR_FALHAS - 1):
+            mudou = registrar_disponibilidade(123, online=False)
+            assert mudou is False
+
+        user = get_user(123, config_padrao)
+        assert user.site_online is True
+        assert user.site_offline_desde is None
+
+    def test_muda_de_online_para_offline(self, config_padrao):
+        """Só ao atingir LIMIAR_FALHAS falhas consecutivas o site é declarado offline."""
+        user = get_user(123, config_padrao)
+        user.site_online = True
+        salvar_user(123, user)
+
+        for _ in range(LIMIAR_FALHAS - 1):
+            registrar_disponibilidade(123, online=False)
 
         mudou = registrar_disponibilidade(123, online=False)
         assert mudou is True
@@ -244,11 +263,15 @@ class TestDisponibilidade:
         assert mudou is False
 
     def test_historico_registrado(self, config_padrao):
+        """O histórico só recebe um evento quando o estado de fato muda, ou
+        seja, depois que o debounce atinge LIMIAR_FALHAS falhas consecutivas."""
         user = get_user(123, config_padrao)
         user.site_online = True
         salvar_user(123, user)
 
-        registrar_disponibilidade(123, online=False)
+        for _ in range(LIMIAR_FALHAS):
+            registrar_disponibilidade(123, online=False)
+
         user = get_user(123, config_padrao)
         assert len(user.historico_disponibilidade) == 1
         assert user.historico_disponibilidade[0].evento == "caiu"

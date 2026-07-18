@@ -89,6 +89,17 @@ HTML_LINK_GENERICO = """
 </body></html>
 """
 
+HTML_PDF_IRRELEVANTE = """
+<html><body>
+  <table>
+    <tr>
+      <td>Relatorio Anual de Atividades 2024</td>
+      <td><a href="relatorio_anual.pdf">Download PDF</a></td>
+    </tr>
+  </table>
+</body></html>
+"""
+
 
 # ─────────────────────────────────────────────
 # checar_site
@@ -228,6 +239,17 @@ class TestPegarEditais:
         assert "Edital 010" in titulo or "Informatica" in titulo or "Cabo" in titulo
 
     @pytest.mark.asyncio
+    async def test_ignora_pdf_sem_palavra_chave_em_titulo_ou_contexto(self):
+        """PDF cujo título do <a> E contexto ao redor não mencionam edital/seleção/
+        concurso/etc. deve continuar sendo ignorado — o fallback pro contexto não
+        deve virar 'aceita qualquer PDF da página'."""
+        with patch("bot.scraper.fazer_request", new_callable=AsyncMock) as mock_req:
+            mock_req.return_value = _mock_response(text=HTML_PDF_IRRELEVANTE)
+            editais = await pegar_editais("https://exemplo.com/editais/")
+
+        assert editais == []
+
+    @pytest.mark.asyncio
     async def test_deduplica_mesmo_link(self):
         html = """<html><body>
           <a href="edital_001.pdf">Edital 001 - Cabo TI</a>
@@ -321,7 +343,9 @@ class TestBuscarNovosEditais:
             )
 
         assert len(resultado["novos_aceitos"]) == 1
-        assert resultado["novos_aceitos"][0].encontrado_em == "titulo"
+        # O termo "informatica" só aparece no texto_contexto (o título é só "Edital
+        # 001/2024"), então encontrado_em deve refletir isso corretamente.
+        assert resultado["novos_aceitos"][0].encontrado_em == "contexto_pagina"
 
     @pytest.mark.asyncio
     async def test_rejeita_edital_cidade_ausente_em_tudo(self, user_cabo, tmp_path, monkeypatch):
