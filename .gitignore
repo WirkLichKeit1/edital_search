@@ -162,3 +162,6 @@ cython_debug/
 .replit
 uv.lock
 pyproject.toml
+
+# Banco de dados local (dados reais de usuário: cidade, termos, editais)
+data/
