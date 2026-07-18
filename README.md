@@ -21,8 +21,8 @@ Bot para Telegram que monitora a página de editais do SENAI-PE e notifica quand
 
 ```bash
 # Clone o repositório
-git clone <url-do-repo>
-cd senai-editais-bot
+git clone https://github.com/WirkLichKeit1/edital_search.git
+cd edital_search
 
 # Instale as dependências
 pip install -r requirements.txt
@@ -39,14 +39,17 @@ cp .env.example .env
 ```env
 BOT_TOKEN=seu_token_aqui
 
-# Opcional — sobrescreve o config.yaml
+# Opcional — sobrescrevem os valores de config.yaml
 URL_EDITAIS=https://www.pe.senai.br/editais/
 URL_PORTAL=https://sge.pe.senai.br
 CIDADE_PADRAO=cabo
 INTERVALO_MONITOR=300
 INTERVALO_BUSCA=86400
+
+# Opcional — não têm equivalente em config.yaml, usam o default se omitidos
 PORT=10000
 REQUEST_TIMEOUT=30
+MAX_RETRIES=3
 ```
 
 ### `config.yaml`
@@ -134,18 +137,19 @@ O edital é aceito assim que passa em qualquer etapa; o PDF só é baixado se as
 ├── config.yaml              # Padrões globais do bot
 ├── server.py                # Servidor Flask para health check
 ├── requirements.txt
-└── bot/
-    ├── database.py          # Modelos de dados e persistência (JSON)
-    ├── scraper.py           # Scraping da página e extração de PDFs
-    ├── filters.py           # Funções puras de filtragem (cidade, termos)
-    ├── formatters.py        # Formatação de mensagens Telegram (MarkdownV2)
-    ├── jobs.py              # Jobs automáticos (monitor e busca periódica)
-    ├── scheduler.py         # Helper central de agendamento de jobs
-    └── commands/
-        ├── info.py          # /start, /ajuda, /status
-        ├── monitor.py       # /checar, /auto, /parar
-        ├── busca.py         # /buscar, /listar, /rejeitados, /forcar
-        └── config.py        # /config, /addtermo, /rmtermo, /termos, /resetconfig, /horario
+├── bot/
+│   ├── database.py          # Modelos de dados e persistência (JSON)
+│   ├── scraper.py           # Scraping da página e extração de PDFs
+│   ├── filters.py           # Funções puras de filtragem (cidade, termos)
+│   ├── formatters.py        # Formatação de mensagens Telegram (MarkdownV2)
+│   ├── jobs.py              # Jobs automáticos (monitor e busca periódica)
+│   ├── scheduler.py         # Helper central de agendamento de jobs
+│   └── commands/
+│       ├── info.py          # /start, /ajuda, /status
+│       ├── monitor.py       # /checar, /auto, /parar
+│       ├── busca.py         # /buscar, /listar, /rejeitados, /forcar
+│       └── config.py        # /config, /addtermo, /rmtermo, /termos, /resetconfig, /horario
+└── tests/                   # Suíte pytest (filtros, banco de dados, scraper)
 ```
 
 ## Persistência
